@@ -1,4 +1,4 @@
-const CACHE = 'expiry-tracker-v2';
+const CACHE = 'expiry-tracker-v3';
 const ASSETS = [
   './',
   './index.html',
