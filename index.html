@@ -979,63 +979,83 @@ function App(){
   const [selected,setSelected]=useState(null);
   const [editing,setEditing]=useState(null);
 
-  // ── Persist helpers — write to localStorage immediately, then update state ──
-  function setAndSaveProducts(updater){
-    setProducts(prev=>{
-      const next=typeof updater==='function'?updater(prev):updater;
-      save(SK.p,next); // synchronous write BEFORE React schedules next render
-      return next;
-    });
+  // ── Direct save helpers ───────────────────────────────────────────────────
+  // Rule: compute new state FIRST → localStorage.setItem() → then setProducts().
+  // Never call save() inside a React setState updater — React 18 automatic
+  // batching may defer the updater to the next microtask, leaving a window
+  // where iOS can terminate the process before the write completes.
+
+  function addProd(data){
+    const p={id:uid(),createdAt:new Date().toISOString(),...data};
+    const next=[...products,p];
+    save(SK.p,next);          // ← synchronous disk write
+    setProducts(next);         // ← then tell React
   }
-  function setAndSaveSettings(updater){
-    setSettings(prev=>{
-      const next=typeof updater==='function'?updater(prev):updater;
-      save(SK.s,next);
-      return next;
-    });
+  function editProd(id,data){
+    const next=products.map(p=>p.id===id?{...p,...data}:p);
+    save(SK.p,next);
+    setProducts(next);
+  }
+  function removeProd(id){
+    const next=products.filter(p=>p.id!==id);
+    save(SK.p,next);
+    setProducts(next);
+  }
+  function saveSetting(k,v){
+    const next={...settings,[k]:v};
+    save(SK.s,next);
+    setSettings(next);
   }
 
-  // Check notifications on open + register SW
+  // Keep refs in sync so the visibilitychange handler always sees latest data
+  const productsRef=useRef(products);
+  const settingsRef=useRef(settings);
+  useEffect(()=>{productsRef.current=products;},[products]);
+  useEffect(()=>{settingsRef.current=settings;},[settings]);
+
+  // One-time setup: SW registration + notification check + background flush
   useEffect(()=>{
-    askPerm().then(ok=>{if(ok)runNotifCheck(products,settings);});
+    // Service worker
     if('serviceWorker'in navigator){
       navigator.serviceWorker.register('sw.js').catch(()=>{});
     }
-    // Safety net: flush to localStorage the instant iOS sends the app to background
-    function onHide(){
+    // Notifications
+    askPerm().then(ok=>{
+      if(ok)runNotifCheck(productsRef.current,settingsRef.current);
+    });
+    // Flush to localStorage the instant iOS moves the app to background.
+    // Uses refs so we always write the latest state, not a stale closure.
+    function flush(){
       if(document.visibilityState==='hidden'){
-        save(SK.p,products);
-        save(SK.s,settings);
+        save(SK.p,productsRef.current);
+        save(SK.s,settingsRef.current);
       }
     }
-    document.addEventListener('visibilitychange',onHide);
-    window.addEventListener('pagehide',onHide);
+    document.addEventListener('visibilitychange',flush);
+    window.addEventListener('pagehide',flush);
     return()=>{
-      document.removeEventListener('visibilitychange',onHide);
-      window.removeEventListener('pagehide',onHide);
+      document.removeEventListener('visibilitychange',flush);
+      window.removeEventListener('pagehide',flush);
     };
-  },[products,settings]);
+  },[]);  // ← empty deps: register once, refs keep it current
 
   function handleSave(data,editId){
     if(editId){
-      setAndSaveProducts(prev=>prev.map(p=>p.id===editId?{...p,...data}:p));
+      editProd(editId,data);
       setEditing(null);
       if(selected&&selected.id===editId)setSelected(s=>({...s,...data}));
       setScreen(selected?'detail':'products');
     }else{
-      const p={...data,id:uid(),createdAt:new Date().toISOString()};
-      setAndSaveProducts(prev=>[...prev,p]);
+      addProd(data);
     }
   }
-
   function handleDelete(id){
-    setAndSaveProducts(prev=>prev.filter(p=>p.id!==id));
+    removeProd(id);
     setSelected(null);setEditing(null);setScreen('products');
   }
-
   function handleProduct(p){setSelected(p);setScreen('detail');}
   function handleEdit(){setEditing(selected);setScreen('edit');}
-  function updateSetting(k,v){setAndSaveSettings(s=>({...s,[k]:v}));}
+  function updateSetting(k,v){saveSetting(k,v);}
 
   function navigate(s){
     if(s!=='detail'&&s!=='edit'){setSelected(null);setEditing(null);}
