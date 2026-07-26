@@ -19,8 +19,11 @@ html,body{height:100%;overflow:hidden}
 body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Helvetica Neue",Arial,sans-serif;
   background:#0F172A;-webkit-font-smoothing:antialiased;-webkit-tap-highlight-color:transparent}
 ::-webkit-scrollbar{display:none}
-input,button,textarea,select{font-family:inherit;-webkit-appearance:none;appearance:none;border:none;outline:none}
-input[type="date"]::-webkit-calendar-picker-indicator{opacity:.5;cursor:pointer}
+input,button,textarea,select{font-family:inherit;border:none;outline:none}
+/* Never suppress native appearance on date inputs — doing so kills the iOS date picker wheel */
+input:not([type="date"]),button,select{-webkit-appearance:none;appearance:none}
+input[type="date"]{-webkit-appearance:auto;appearance:auto;cursor:pointer;min-width:120px}
+input[type="date"]::-webkit-calendar-picker-indicator{opacity:.6;cursor:pointer;padding:4px}
 #root{height:100%;display:flex;align-items:flex-start;justify-content:center}
 #shell{
   width:100%;max-width:430px;height:100%;
@@ -588,15 +591,19 @@ function AddScreen({onSave,onClose,editProduct=null}){
           )},
           {label:'购买日期',req:true,content:(
             <input type="date" value={purchase} onChange={e=>setPurchase(e.target.value)}
-              style={{border:'none',fontSize:14,color:C.primary,background:'transparent',fontWeight:'700'}}/>
+              style={{fontSize:14,color:C.primary,fontWeight:'700',
+                background:'transparent',padding:'4px 0',minWidth:130}}/>
           )},
           {label:'到期日期',req:true,content:(
             <input type="date" value={expiry} onChange={e=>setExpiry(e.target.value)}
-              style={{border:'none',fontSize:14,color:C.primary,background:'transparent',fontWeight:'700'}}/>
+              placeholder="请选择日期"
+              style={{fontSize:14,color:expiry?C.primary:C.textMuted,fontWeight:'700',
+                background:'transparent',padding:'4px 0',minWidth:130}}/>
           )},
           {label:'生产日期',req:false,content:(
             <input type="date" value={prod} onChange={e=>setProd(e.target.value)}
-              style={{border:'none',fontSize:14,color:C.textMuted,background:'transparent',fontWeight:'600'}}/>
+              style={{fontSize:14,color:prod?C.primary:C.textMuted,fontWeight:'600',
+                background:'transparent',padding:'4px 0',minWidth:130}}/>
           )},
           {label:'备注',req:false,content:(
             <input value={notes} onChange={e=>setNotes(e.target.value)} placeholder="可选备注…"
