@@ -979,38 +979,63 @@ function App(){
   const [selected,setSelected]=useState(null);
   const [editing,setEditing]=useState(null);
 
-  useEffect(()=>{save(SK.p,products);},[products]);
-  useEffect(()=>{save(SK.s,settings);},[settings]);
+  // ── Persist helpers — write to localStorage immediately, then update state ──
+  function setAndSaveProducts(updater){
+    setProducts(prev=>{
+      const next=typeof updater==='function'?updater(prev):updater;
+      save(SK.p,next); // synchronous write BEFORE React schedules next render
+      return next;
+    });
+  }
+  function setAndSaveSettings(updater){
+    setSettings(prev=>{
+      const next=typeof updater==='function'?updater(prev):updater;
+      save(SK.s,next);
+      return next;
+    });
+  }
 
-  // Check notifications on open
+  // Check notifications on open + register SW
   useEffect(()=>{
     askPerm().then(ok=>{if(ok)runNotifCheck(products,settings);});
-    // Register service worker
     if('serviceWorker'in navigator){
       navigator.serviceWorker.register('sw.js').catch(()=>{});
     }
-  },[]);
+    // Safety net: flush to localStorage the instant iOS sends the app to background
+    function onHide(){
+      if(document.visibilityState==='hidden'){
+        save(SK.p,products);
+        save(SK.s,settings);
+      }
+    }
+    document.addEventListener('visibilitychange',onHide);
+    window.addEventListener('pagehide',onHide);
+    return()=>{
+      document.removeEventListener('visibilitychange',onHide);
+      window.removeEventListener('pagehide',onHide);
+    };
+  },[products,settings]);
 
   function handleSave(data,editId){
     if(editId){
-      setProducts(prev=>prev.map(p=>p.id===editId?{...p,...data}:p));
+      setAndSaveProducts(prev=>prev.map(p=>p.id===editId?{...p,...data}:p));
       setEditing(null);
-      if(selected&&selected.id===editId)setSelected({...selected,...data});
+      if(selected&&selected.id===editId)setSelected(s=>({...s,...data}));
       setScreen(selected?'detail':'products');
     }else{
       const p={...data,id:uid(),createdAt:new Date().toISOString()};
-      setProducts(prev=>[...prev,p]);
+      setAndSaveProducts(prev=>[...prev,p]);
     }
   }
 
   function handleDelete(id){
-    setProducts(prev=>prev.filter(p=>p.id!==id));
+    setAndSaveProducts(prev=>prev.filter(p=>p.id!==id));
     setSelected(null);setEditing(null);setScreen('products');
   }
 
   function handleProduct(p){setSelected(p);setScreen('detail');}
   function handleEdit(){setEditing(selected);setScreen('edit');}
-  function updateSetting(k,v){setSettings(s=>({...s,[k]:v}));}
+  function updateSetting(k,v){setAndSaveSettings(s=>({...s,[k]:v}));}
 
   function navigate(s){
     if(s!=='detail'&&s!=='edit'){setSelected(null);setEditing(null);}
@@ -1020,7 +1045,7 @@ function App(){
   const showTab=!['detail','edit'].includes(screen);
 
   return(
-    <div id="shell" style={{display:'flex',flexDirection:'column',height:'100%',background:C.bg}}>
+    <div style={{display:'flex',flexDirection:'column',height:'100%',background:C.bg,overflow:'hidden'}}>
       <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden'}}>
         {screen==='home'&&<HomeScreen products={products} onProduct={handleProduct}/>}
         {screen==='products'&&<ProductsScreen products={products} onProduct={handleProduct}/>}
