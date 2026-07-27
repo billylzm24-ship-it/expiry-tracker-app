@@ -20,32 +20,29 @@ body{font-family:-apple-system,BlinkMacSystemFont,"SF Pro Display","Helvetica Ne
   background:#0F172A;-webkit-font-smoothing:antialiased;-webkit-tap-highlight-color:transparent}
 ::-webkit-scrollbar{display:none}
 input,button,textarea,select{font-family:inherit;border:none;outline:none}
-/* Never suppress native appearance on date inputs — doing so kills the iOS date picker wheel */
 input:not([type="date"]),button,select{-webkit-appearance:none;appearance:none}
-input[type="date"]{-webkit-appearance:auto;appearance:auto;cursor:pointer;min-width:120px}
+input[type="date"]{-webkit-appearance:auto;appearance:auto;cursor:pointer;min-width:130px;padding:4px 0}
 input[type="date"]::-webkit-calendar-picker-indicator{opacity:.6;cursor:pointer;padding:4px}
 #root{height:100%;display:flex;align-items:flex-start;justify-content:center}
-#shell{
-  width:100%;max-width:430px;height:100%;
-  display:flex;flex-direction:column;background:#F1F5F9;
-  position:relative;overflow:hidden;
-}
+#shell{width:100%;max-width:430px;height:100%;display:flex;flex-direction:column;
+  background:#F1F5F9;position:relative;overflow:hidden}
 @keyframes fadeUp{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
 .fade-up{animation:fadeUp .18s ease}
 @keyframes scanLine{0%,100%{transform:translateY(0)}50%{transform:translateY(228px)}}
 .scan-laser{animation:scanLine 2s ease-in-out infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.spin{animation:spin .7s linear infinite}
 @media(min-width:500px){
   #root{padding:24px}
   #shell{height:844px;border-radius:54px;
-    box-shadow:0 40px 100px rgba(0,0,0,.55),0 0 0 10px #1E293B,0 0 0 12px #0F172A;
-    overflow:hidden}
+    box-shadow:0 40px 100px rgba(0,0,0,.55),0 0 0 10px #1E293B,0 0 0 12px #0F172A;overflow:hidden}
 }
 </style>
 </head>
 <body>
 <div id="root"><div id="shell"></div></div>
 <script type="text/babel">
-const {useState,useEffect,useRef,useMemo,useCallback}=React;
+const {useState,useEffect,useRef,useMemo}=React;
 
 // ─── TOKENS ──────────────────────────────────────────────────────────────────
 const C={
@@ -61,15 +58,16 @@ const C={
 const CATS={dairy:'🥛',medicine:'💊',food:'🥫',beauty:'🧴',other:'📦'};
 const CAT_LABELS={dairy:'乳制品',medicine:'药品',food:'食品',beauty:'美妆',other:'其他'};
 const CAT_LIST=['food','dairy','medicine','beauty','other'];
+const SK={p:'et-v2-products',s:'et-v2-settings',n:'et-v2-notifs'};
+const DEF_SETTINGS={threeMonths:true,twoMonths:true,oneMonth:true,twoWeeks:true,oneWeek:true,daily:true};
 
 // ─── UTILS ───────────────────────────────────────────────────────────────────
-const d864=864e5;
 function getDaysLeft(exp){
   const t=new Date();t.setHours(0,0,0,0);
   const e=new Date(exp);e.setHours(0,0,0,0);
-  return Math.ceil((e-t)/d864);
+  return Math.ceil((e-t)/864e5);
 }
-function getTotalDays(p,e){return Math.max(1,Math.ceil((new Date(e)-new Date(p))/d864));}
+function getTotalDays(p,e){return Math.max(1,Math.ceil((new Date(e)-new Date(p))/864e5));}
 function isFresh(p,e){return getTotalDays(p,e)<30;}
 function urgency(d){
   if(d<0)  return{color:C.expired, bg:C.expiredBg, label:'已过期'};
@@ -80,13 +78,63 @@ function urgency(d){
 }
 function todayStr(){return new Date().toISOString().split('T')[0];}
 function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2);}
-function fmtDate(d){return d instanceof Date?d.toISOString().split('T')[0]:d||'';}
 
-// ─── STORAGE ─────────────────────────────────────────────────────────────────
-const SK={p:'et-v2-products',s:'et-v2-settings',n:'et-v2-notifs'};
-function load(k,def){try{const v=localStorage.getItem(k);return v?JSON.parse(v):def;}catch{return def;}}
-function save(k,v){try{localStorage.setItem(k,JSON.stringify(v));}catch{}}
-const DEF_SETTINGS={threeMonths:true,twoMonths:true,oneMonth:true,twoWeeks:true,oneWeek:true,daily:true};
+// ─── STORAGE — IndexedDB primary, localStorage fallback ───────────────────────
+// IndexedDB survives iOS force-close; localStorage can be silently discarded.
+
+let _idb=null;
+function openIDB(){
+  if(_idb)return Promise.resolve(_idb);
+  return new Promise((res,rej)=>{
+    const r=indexedDB.open('expiry-tracker-db',1);
+    r.onupgradeneeded=e=>e.target.result.createObjectStore('kv');
+    r.onsuccess=e=>{_idb=e.target.result;res(_idb);};
+    r.onerror=()=>rej(r.error);
+  });
+}
+async function idbGet(key){
+  try{
+    const db=await openIDB();
+    return new Promise((res,rej)=>{
+      const req=db.transaction('kv','readonly').objectStore('kv').get(key);
+      req.onsuccess=()=>res(req.result??null);
+      req.onerror=()=>rej(req.error);
+    });
+  }catch{return null;}
+}
+async function idbSet(key,value){
+  try{
+    const db=await openIDB();
+    return new Promise((res,rej)=>{
+      const tx=db.transaction('kv','readwrite');
+      tx.objectStore('kv').put(value,key);
+      tx.oncomplete=res;
+      tx.onerror=()=>rej(tx.error);
+    });
+  }catch{}
+}
+function lsGet(k,def){try{const v=localStorage.getItem(k);return v?JSON.parse(v):def;}catch{return def;}}
+function lsSet(k,v){try{localStorage.setItem(k,JSON.stringify(v));}catch{}}
+
+// Write to BOTH storages; IDB is async (fire-and-forget for speed)
+function persist(key,value){
+  lsSet(key,value);         // synchronous backup
+  idbSet(key,value);        // durable async primary
+}
+
+// Load: IDB first (most reliable), fallback to localStorage, migrate if needed
+async function loadData(key,def){
+  const idbVal=await idbGet(key);
+  if(idbVal!==null){
+    lsSet(key,idbVal); // keep localStorage in sync
+    return idbVal;
+  }
+  const lsVal=lsGet(key,def);
+  if(JSON.stringify(lsVal)!==JSON.stringify(def)){
+    idbSet(key,lsVal); // migrate existing localStorage data into IDB
+  }
+  return lsVal;
+}
 
 // ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
 async function askPerm(){
@@ -99,19 +147,18 @@ function fireNotif(title,body,tag){
   try{new Notification(title,{body,tag,icon:'icons/icon-192.png'});}catch{}
 }
 function runNotifCheck(products,settings){
-  const log=load(SK.n,{});const td=todayStr();
+  const log=lsGet(SK.n,{});const td=todayStr();
   products.forEach(p=>{
     const d=getDaysLeft(p.expiryDate);
     if(isFresh(p.purchaseDate,p.expiryDate)&&settings.daily&&d>=0&&d<=29){
       const k=`d|${p.id}|${td}`;
       if(!log[k]){fireNotif('⚡ 新鲜食品提醒',`${p.name} 还剩 ${d} 天到期，请尽快使用！`,k);log[k]=1;}
     }
-    [
-      {days:90,sk:'threeMonths',t:'📅 提前预警 — 3个月',b:`${p.name} 将在约3个月后到期`},
-      {days:60,sk:'twoMonths',  t:'📅 提前预警 — 2个月',b:`${p.name} 将在约2个月后到期`},
-      {days:30,sk:'oneMonth',   t:'⚠️ 提前预警 — 1个月',b:`${p.name} 将在约1个月后到期`},
-      {days:14,sk:'twoWeeks',   t:'⚠️ 提前预警 — 2周',  b:`${p.name} 还剩约2周到期！`},
-      {days:7, sk:'oneWeek',    t:'🚨 最后预警 — 1周',  b:`${p.name} 还剩约7天到期，请尽快使用！`},
+    [{days:90,sk:'threeMonths',t:'📅 提前预警 — 3个月',b:`${p.name} 将在约3个月后到期`},
+     {days:60,sk:'twoMonths',  t:'📅 提前预警 — 2个月',b:`${p.name} 将在约2个月后到期`},
+     {days:30,sk:'oneMonth',   t:'⚠️ 提前预警 — 1个月',b:`${p.name} 将在约1个月后到期`},
+     {days:14,sk:'twoWeeks',   t:'⚠️ 提前预警 — 2周',  b:`${p.name} 还剩约2周到期！`},
+     {days:7, sk:'oneWeek',    t:'🚨 最后预警 — 1周',  b:`${p.name} 还剩约7天到期！`},
     ].forEach(m=>{
       if(!settings[m.sk])return;
       if(d>=0&&d<=m.days&&d>m.days-7){
@@ -120,21 +167,21 @@ function runNotifCheck(products,settings){
       }
     });
   });
-  save(SK.n,log);
+  lsSet(SK.n,log);
 }
 
 // ─── OPEN FOOD FACTS ─────────────────────────────────────────────────────────
 async function lookupBarcode(barcode){
-  const url=`https://world.openfoodfacts.org/api/v2/product/${barcode}.json?fields=product_name,product_name_zh,brands,categories_tags`;
-  const r=await fetch(url,{headers:{'User-Agent':'ExpiryTracker-PWA/2.0'}});
+  const r=await fetch(`https://world.openfoodfacts.org/api/v2/product/${barcode}.json?fields=product_name,product_name_zh,brands,categories_tags`,
+    {headers:{'User-Agent':'ExpiryTracker-PWA/2.0'}});
   const data=await r.json();
   if(data.status!==1||!data.product)throw new Error('not found');
   const p=data.product;
   const name=(p.product_name_zh||p.product_name||'').trim();
   if(!name)throw new Error('no name');
   const tags=(p.categories_tags||[]).join(' ');
-  const cat=/dairies|milks?|yogurt|cheese|cream/i.test(tags)?'dairy':
-             /medicine|drug|pharma|health-product/i.test(tags)?'medicine':
+  const cat=/dairies|milks?|yogurt|cheese/i.test(tags)?'dairy':
+             /medicine|drug|pharma/i.test(tags)?'medicine':
              /beauty|cosmetic|skincare/i.test(tags)?'beauty':'food';
   return{name,brand:p.brands?p.brands.split(',')[0].trim():undefined,category:cat,barcode};
 }
@@ -170,8 +217,7 @@ function ProductCard({product,onClick,accent=false}){
       background:C.surface,borderRadius:18,padding:'14px 16px',display:'flex',
       alignItems:'center',gap:14,cursor:'pointer',
       boxShadow:'0 1px 4px rgba(0,0,0,.06)',
-      borderLeft:accent?`4px solid ${u.color}`:'none',userSelect:'none',
-    }}>
+      borderLeft:accent?`4px solid ${u.color}`:'none',userSelect:'none'}}>
       <div style={{width:44,height:44,borderRadius:13,background:u.bg,
         display:'flex',alignItems:'center',justifyContent:'center',fontSize:22,flexShrink:0}}>
         {CATS[product.category]||'📦'}
@@ -191,11 +237,8 @@ function ProductCard({product,onClick,accent=false}){
 // ─── TAB BAR ─────────────────────────────────────────────────────────────────
 function TabBar({current,onNav}){
   const tabs=[
-    {id:'home',label:'首页',icon:'🏠'},
-    {id:'products',label:'产品',icon:'☰'},
-    {id:'add',label:'',icon:'+'},
-    {id:'alerts',label:'提醒',icon:'🔔'},
-    {id:'settings',label:'设置',icon:'⚙️'},
+    {id:'home',label:'首页',icon:'🏠'},{id:'products',label:'产品',icon:'☰'},
+    {id:'add',label:'',icon:'+'},{id:'alerts',label:'提醒',icon:'🔔'},{id:'settings',label:'设置',icon:'⚙️'},
   ];
   return(
     <div style={{display:'flex',borderTop:`1px solid ${C.border}`,
@@ -205,16 +248,16 @@ function TabBar({current,onNav}){
         if(t.id==='add')return(
           <button key="add" onClick={()=>onNav('add')} style={{flex:1,background:'transparent',
             cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',padding:'8px 0'}}>
-            <div style={{width:48,height:48,borderRadius:24,background:C.primary,
-              display:'flex',alignItems:'center',justifyContent:'center',
-              marginTop:-18,boxShadow:`0 4px 14px ${C.primary}66`,fontSize:28,color:'white',lineHeight:1}}>+</div>
+            <div style={{width:48,height:48,borderRadius:24,background:C.primary,display:'flex',
+              alignItems:'center',justifyContent:'center',marginTop:-18,
+              boxShadow:`0 4px 14px ${C.primary}66`,fontSize:28,color:'white',lineHeight:1}}>+</div>
           </button>
         );
         const active=current===t.id;
         return(
           <button key={t.id} onClick={()=>onNav(t.id)} style={{flex:1,background:'transparent',
             cursor:'pointer',display:'flex',flexDirection:'column',alignItems:'center',
-            gap:2,padding:'8px 0',color:active?C.primary:C.textMuted,border:'none'}}>
+            gap:2,padding:'8px 0',color:active?C.primary:C.textMuted}}>
             <span style={{fontSize:20,lineHeight:1}}>{t.icon}</span>
             <span style={{fontSize:10,fontWeight:active?700:500}}>{t.label}</span>
           </button>
@@ -235,7 +278,6 @@ function HomeScreen({products,onProduct}){
   const greet=hr<12?'早上好':hr<17?'下午好':'晚上好';
   return(
     <div style={{flex:1,overflowY:'auto',background:C.bg}} className="fade-up">
-      {/* Gradient header */}
       <div style={{background:`linear-gradient(160deg,${C.primaryDark},${C.primary})`,
         padding:'env(safe-area-inset-top,14px) 20px 28px',color:'white',position:'relative',overflow:'hidden'}}>
         <div style={{position:'absolute',top:-30,right:-30,width:160,height:160,
@@ -254,8 +296,7 @@ function HomeScreen({products,onProduct}){
           )}
         </div>
         <div style={{display:'flex',gap:10,marginTop:20,position:'relative'}}>
-          {[
-            {label:'已过期',value:expired.length,bg:C.expiredBg,tc:C.expired},
+          {[{label:'已过期',value:expired.length,bg:C.expiredBg,tc:C.expired},
             {label:'本周到期',value:critical.length,bg:C.criticalBg,tc:C.critical},
             {label:'共追踪',value:products.length,bg:'rgba(255,255,255,.95)',tc:C.primary},
           ].map(s=>(
@@ -306,10 +347,8 @@ function HomeScreen({products,onProduct}){
 function ProductsScreen({products,onProduct}){
   const [filter,setFilter]=useState('all');
   const [search,setSearch]=useState('');
-  const pills=[
-    {id:'all',label:'全部'},{id:'expired',label:'⚠️ 已过期'},
-    {id:'critical',label:'🔴 7天内'},{id:'month',label:'🟠 1月内'},{id:'safe',label:'🟢 安全'},
-  ];
+  const pills=[{id:'all',label:'全部'},{id:'expired',label:'⚠️ 已过期'},
+    {id:'critical',label:'🔴 7天内'},{id:'month',label:'🟠 1月内'},{id:'safe',label:'🟢 安全'}];
   const visible=useMemo(()=>products.filter(p=>{
     if(search&&!p.name.toLowerCase().includes(search.toLowerCase()))return false;
     const d=getDaysLeft(p.expiryDate);
@@ -329,19 +368,16 @@ function ProductsScreen({products,onProduct}){
           <input value={search} onChange={e=>setSearch(e.target.value)}
             placeholder="搜索产品名称（支持中文输入）"
             style={{flex:1,fontSize:14,color:C.text,background:'transparent'}}/>
-          {search&&<button onClick={()=>setSearch('')} style={{fontSize:13,color:C.textMuted,
-            background:C.textMuted,color:'white',borderRadius:'50%',width:18,height:18,cursor:'pointer',
+          {search&&<button onClick={()=>setSearch('')} style={{fontSize:11,background:C.textMuted,
+            color:'white',borderRadius:'50%',width:18,height:18,cursor:'pointer',
             display:'flex',alignItems:'center',justifyContent:'center'}}>✕</button>}
         </div>
         <div style={{display:'flex',gap:7,overflowX:'auto',paddingBottom:2}}>
           {pills.map(f=>(
             <button key={f.id} onClick={()=>setFilter(f.id)} style={{
               whiteSpace:'nowrap',padding:'6px 14px',borderRadius:20,
-              background:filter===f.id?C.primary:C.bg,
-              color:filter===f.id?'white':C.textSub,
-              fontSize:12,fontWeight:'700',cursor:'pointer',flexShrink:0}}>
-              {f.label}
-            </button>
+              background:filter===f.id?C.primary:C.bg,color:filter===f.id?'white':C.textSub,
+              fontSize:12,fontWeight:'700',cursor:'pointer',flexShrink:0}}>{f.label}</button>
           ))}
         </div>
       </div>
@@ -362,17 +398,16 @@ function ProductsScreen({products,onProduct}){
 // ─── BARCODE SCANNER ─────────────────────────────────────────────────────────
 function BarcodeScanner({onResult,onClose}){
   const videoRef=useRef(null);
-  const [status,setStatus]=useState('scanning'); // scanning | loading | notfound | error
+  const [status,setStatus]=useState('scanning');
   const [errMsg,setErrMsg]=useState('');
   const streamRef=useRef(null);
-  const detectorRef=useRef(null);
   const rafRef=useRef(null);
-
+  const detectorRef=useRef(null);
   useEffect(()=>{
     let cancelled=false;
     async function start(){
       try{
-        const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1280}}});
+        const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
         streamRef.current=stream;
         if(cancelled){stream.getTracks().forEach(t=>t.stop());return;}
         if(videoRef.current){videoRef.current.srcObject=stream;await videoRef.current.play();}
@@ -382,82 +417,53 @@ function BarcodeScanner({onResult,onClose}){
         }else{
           setStatus('error');setErrMsg('您的浏览器暂不支持条形码扫描。\n请升级至 iOS 17+ 或使用 Chrome 浏览器。');
         }
-      }catch(e){
-        setStatus('error');setErrMsg('无法访问相机。\n请在设置中允许浏览器使用相机。');
-      }
+      }catch{setStatus('error');setErrMsg('无法访问相机。\n请在设置中允许浏览器使用相机。');}
     }
     async function scan(){
-      if(cancelled||!videoRef.current||!detectorRef.current)return;
-      if(videoRef.current.readyState===4){
+      if(cancelled)return;
+      if(videoRef.current?.readyState===4){
         try{
           const codes=await detectorRef.current.detect(videoRef.current);
-          if(codes.length>0&&!cancelled){
-            await handleCode(codes[0].rawValue);return;
-          }
+          if(codes.length>0&&!cancelled){await handleCode(codes[0].rawValue);return;}
         }catch{}
       }
       rafRef.current=requestAnimationFrame(scan);
     }
-    start();
-    return()=>{
-      cancelled=true;
-      if(rafRef.current)cancelAnimationFrame(rafRef.current);
-      if(streamRef.current)streamRef.current.getTracks().forEach(t=>t.stop());
-    };
-  },[]);
-
-  async function handleCode(code){
-    setStatus('loading');
-    try{
-      const product=await lookupBarcode(code);
-      stop();onResult(product);
-    }catch{
-      setStatus('notfound');setErrMsg(code);
+    async function handleCode(code){
+      setStatus('loading');
+      try{const p=await lookupBarcode(code);stop();onResult(p);}
+      catch{setStatus('notfound');setErrMsg(code);}
     }
-  }
-
-  function stop(){
-    if(streamRef.current)streamRef.current.getTracks().forEach(t=>t.stop());
-  }
-
-  function useManual(){stop();onResult({name:'',category:'food',barcode:errMsg||''});}
-  function retry(){setStatus('scanning');}
-
+    start();
+    return()=>{cancelled=true;if(rafRef.current)cancelAnimationFrame(rafRef.current);stop();};
+  },[]);
+  function stop(){if(streamRef.current)streamRef.current.getTracks().forEach(t=>t.stop());}
   return(
     <div style={{position:'absolute',inset:0,zIndex:100,background:'#000',display:'flex',flexDirection:'column'}}>
       <video ref={videoRef} style={{position:'absolute',inset:0,width:'100%',height:'100%',objectFit:'cover'}} playsInline muted/>
-      {/* Overlay */}
       <div style={{position:'absolute',inset:0,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center'}}>
-        {/* Top dim */}
         <div style={{position:'absolute',top:0,left:0,right:0,height:'30%',background:'rgba(0,0,0,.6)'}}/>
-        {/* Bottom dim */}
         <div style={{position:'absolute',bottom:0,left:0,right:0,height:'32%',background:'rgba(0,0,0,.6)'}}/>
-        {/* Left/right dim */}
         <div style={{position:'absolute',top:'30%',bottom:'32%',left:0,width:'calc(50% - 130px)',background:'rgba(0,0,0,.6)'}}/>
         <div style={{position:'absolute',top:'30%',bottom:'32%',right:0,width:'calc(50% - 130px)',background:'rgba(0,0,0,.6)'}}/>
-        {/* Viewfinder */}
         <div style={{width:260,height:240,position:'relative',zIndex:1}}>
-          {/* Corners */}
           {[['0','0','borderTop','borderLeft'],['0','auto','borderTop','borderRight'],
             ['auto','0','borderBottom','borderLeft'],['auto','auto','borderBottom','borderRight']].map(([t,r,b1,b2],i)=>(
-            <div key={i} style={{position:'absolute',top:t,right:r==='auto'?'auto':0,bottom:b1==='borderBottom'?0:'auto',
-              left:r==='0'?0:'auto',width:24,height:24,
-              [b1]:`3px solid ${C.primaryMid}`,[b2]:`3px solid ${C.primaryMid}`}}/>
+            <div key={i} style={{position:'absolute',top:t==='auto'?'auto':0,right:r==='auto'?'auto':0,
+              bottom:b1==='borderBottom'?0:'auto',left:r==='0'?0:'auto',
+              width:24,height:24,[b1]:`3px solid ${C.primaryMid}`,[b2]:`3px solid ${C.primaryMid}`}}/>
           ))}
-          {status==='scanning'&&(
-            <div className="scan-laser" style={{position:'absolute',left:10,right:10,height:2,
-              background:C.primaryMid,borderRadius:1,boxShadow:`0 0 8px ${C.primary}`,top:0}}/>
-          )}
+          {status==='scanning'&&<div className="scan-laser" style={{position:'absolute',left:10,right:10,height:2,
+            background:C.primaryMid,borderRadius:1,boxShadow:`0 0 8px ${C.primary}`,top:0}}/>}
           {status==='loading'&&(
-            <div style={{position:'absolute',inset:0,background:'rgba(0,0,0,.7)',display:'flex',
-              flexDirection:'column',alignItems:'center',justifyContent:'center',gap:12}}>
-              <div style={{width:32,height:32,border:'3px solid rgba(255,255,255,.3)',
-                borderTopColor:'white',borderRadius:'50%'}} className="spin-el"/>
+            <div style={{position:'absolute',inset:0,background:'rgba(0,0,0,.7)',
+              display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:12}}>
+              <div className="spin" style={{width:32,height:32,border:'3px solid rgba(255,255,255,.3)',
+                borderTopColor:'white',borderRadius:'50%'}}/>
               <span style={{color:'white',fontSize:14}}>正在查询产品…</span>
             </div>
           )}
         </div>
-        {/* Controls */}
         <div style={{position:'absolute',bottom:0,left:0,right:0,padding:'24px',
           display:'flex',flexDirection:'column',alignItems:'center',gap:12}}>
           {status==='scanning'&&<>
@@ -465,23 +471,23 @@ function BarcodeScanner({onResult,onClose}){
             <span style={{color:'rgba(255,255,255,.4)',fontSize:11}}>支持 EAN-13 · UPC · QR</span>
           </>}
           {status==='notfound'&&<>
-            <span style={{color:'white',fontSize:14,fontWeight:'600',textAlign:'center'}}>未找到产品 (#{errMsg})</span>
+            <span style={{color:'white',fontSize:13,textAlign:'center'}}>未找到产品 #{errMsg}</span>
             <div style={{display:'flex',gap:10}}>
-              <button onClick={retry} style={{background:C.primary,color:'white',padding:'10px 20px',
-                borderRadius:12,fontWeight:'700',cursor:'pointer',fontSize:14}}>重新扫描</button>
-              <button onClick={useManual} style={{background:'rgba(255,255,255,.15)',color:'white',
-                padding:'10px 20px',borderRadius:12,fontWeight:'700',cursor:'pointer',fontSize:14}}>手动输入</button>
+              <button onClick={()=>setStatus('scanning')} style={{background:C.primary,color:'white',
+                padding:'10px 20px',borderRadius:12,fontWeight:'700',cursor:'pointer',fontSize:14}}>重新扫描</button>
+              <button onClick={()=>{stop();onResult({name:'',category:'food',barcode:errMsg});}}
+                style={{background:'rgba(255,255,255,.15)',color:'white',
+                  padding:'10px 20px',borderRadius:12,fontWeight:'700',cursor:'pointer',fontSize:14}}>手动输入</button>
             </div>
           </>}
           {status==='error'&&<>
             <span style={{color:'white',fontSize:13,textAlign:'center',lineHeight:1.6,whiteSpace:'pre-line'}}>{errMsg}</span>
-            <button onClick={useManual} style={{background:'rgba(255,255,255,.15)',color:'white',
-              padding:'10px 24px',borderRadius:12,fontWeight:'700',cursor:'pointer',fontSize:14}}>手动输入</button>
+            <button onClick={()=>{stop();onResult({name:'',category:'food'});}}
+              style={{background:'rgba(255,255,255,.15)',color:'white',
+                padding:'10px 24px',borderRadius:12,fontWeight:'700',cursor:'pointer',fontSize:14}}>手动输入</button>
           </>}
           <button onClick={()=>{stop();onClose();}} style={{background:'rgba(255,255,255,.12)',
-            color:'white',padding:'10px 32px',borderRadius:22,fontWeight:'600',cursor:'pointer',fontSize:15,marginTop:4}}>
-            取消
-          </button>
+            color:'white',padding:'10px 32px',borderRadius:22,fontWeight:'600',cursor:'pointer',fontSize:15,marginTop:4}}>取消</button>
         </div>
       </div>
     </div>
@@ -500,30 +506,26 @@ function AddScreen({onSave,onClose,editProduct=null}){
   const [saving,setSaving]=useState(false);
   const [saved,setSaved]=useState(false);
   const [scanning,setScanning]=useState(false);
-
   const daysLeft=expiry?getDaysLeft(expiry):null;
   const totalDays=expiry?getTotalDays(purchase,expiry):null;
   const u=daysLeft!==null?urgency(daysLeft):null;
   const canSave=name.trim()&&expiry;
-
   function handleScanResult(result){
     setScanning(false);
     if(result.name)setName(result.name);
     if(result.category)setCat(result.category);
   }
-
   async function handleSave(){
     if(!canSave)return;
     setSaving(true);
-    await new Promise(r=>setTimeout(r,200));
+    await new Promise(r=>setTimeout(r,150));
     onSave({name:name.trim(),category:cat,purchaseDate:purchase,
       expiryDate:expiry,productionDate:prod||undefined,notes:notes.trim()||undefined},
       editing?editProduct.id:null);
     if(!editing){setSaved(true);setSaving(false);}
   }
-
+  function reset(){setName('');setCat('food');setPurchase(todayStr());setExpiry('');setProd('');setNotes('');setSaved(false);}
   if(scanning)return <BarcodeScanner onResult={handleScanResult} onClose={()=>setScanning(false)}/>;
-
   if(saved)return(
     <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',
       justifyContent:'center',background:C.bg,gap:14,padding:24}} className="fade-up">
@@ -531,25 +533,22 @@ function AddScreen({onSave,onClose,editProduct=null}){
         display:'flex',alignItems:'center',justifyContent:'center',fontSize:40}}>✅</div>
       <div style={{fontSize:20,fontWeight:'800',color:C.text}}>保存成功！</div>
       <div style={{fontSize:14,color:C.textMuted,textAlign:'center'}}>已为「{name}」设置到期提醒</div>
-      <button onClick={()=>{setName('');setCat('food');setPurchase(todayStr());setExpiry('');setProd('');setNotes('');setSaved(false);}}
-        style={{marginTop:8,padding:'14px 32px',background:C.primary,color:'white',
-          borderRadius:16,fontSize:15,fontWeight:'700',cursor:'pointer'}}>继续添加</button>
+      <button onClick={reset} style={{marginTop:8,padding:'14px 32px',background:C.primary,
+        color:'white',borderRadius:16,fontSize:15,fontWeight:'700',cursor:'pointer'}}>继续添加</button>
     </div>
   );
-
   return(
     <div style={{flex:1,overflowY:'auto',background:C.bg}} className="fade-up">
       <div style={{background:C.surface,borderBottom:`1px solid ${C.border}`,
         padding:'14px 16px 12px',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
         {editing&&<button onClick={onClose} style={{color:C.primary,fontSize:15,fontWeight:'600',
-          background:'transparent',cursor:'pointer'}}>‹ 取消</button>}
+          background:'transparent',cursor:'pointer',marginRight:12}}>‹ 取消</button>}
         <div style={{flex:1}}>
           <div style={{fontSize:20,fontWeight:'800',color:C.text}}>{editing?'编辑产品':'添加产品'}</div>
           <div style={{fontSize:13,color:C.textMuted,marginTop:3}}>支持中文 · English 输入</div>
         </div>
       </div>
       <div style={{padding:'14px 16px 8px'}}>
-        {/* Scan button */}
         <button onClick={()=>setScanning(true)} style={{width:'100%',padding:'14px 16px',
           background:C.primaryLight,borderRadius:16,display:'flex',alignItems:'center',gap:12,
           cursor:'pointer',border:`1.5px solid ${C.primary}33`,marginBottom:14}}>
@@ -560,13 +559,11 @@ function AddScreen({onSave,onClose,editProduct=null}){
           </div>
           <span style={{marginLeft:'auto',fontSize:18,color:C.primary}}>›</span>
         </button>
-        {/* Or divider */}
         <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:14}}>
           <div style={{flex:1,height:1,background:C.border}}/>
           <span style={{fontSize:12,color:C.textMuted,fontWeight:'600'}}>或手动输入</span>
           <div style={{flex:1,height:1,background:C.border}}/>
         </div>
-        {/* Category */}
         <div style={{fontSize:11,fontWeight:'800',color:C.textMuted,marginBottom:10,letterSpacing:.8}}>产品类别</div>
         <div style={{display:'flex',gap:8,overflowX:'auto',paddingBottom:4,marginBottom:8}}>
           {CAT_LIST.map(c=>(
@@ -581,33 +578,28 @@ function AddScreen({onSave,onClose,editProduct=null}){
           ))}
         </div>
       </div>
-      {/* Form card */}
       <div style={{margin:'0 16px',background:C.surface,borderRadius:18,overflow:'hidden',
         boxShadow:'0 1px 4px rgba(0,0,0,.06)'}}>
         {[
           {label:'产品名称',req:true,content:(
             <input value={name} onChange={e=>setName(e.target.value)} placeholder="例：全脂牛奶"
-              style={{border:'none',textAlign:'right',fontSize:15,color:C.textSub,background:'transparent',width:170}}/>
+              style={{textAlign:'right',fontSize:15,color:C.textSub,background:'transparent',width:170}}/>
           )},
           {label:'购买日期',req:true,content:(
             <input type="date" value={purchase} onChange={e=>setPurchase(e.target.value)}
-              style={{fontSize:14,color:C.primary,fontWeight:'700',
-                background:'transparent',padding:'4px 0',minWidth:130}}/>
+              style={{fontSize:14,color:C.primary,fontWeight:'700',background:'transparent'}}/>
           )},
           {label:'到期日期',req:true,content:(
             <input type="date" value={expiry} onChange={e=>setExpiry(e.target.value)}
-              placeholder="请选择日期"
-              style={{fontSize:14,color:expiry?C.primary:C.textMuted,fontWeight:'700',
-                background:'transparent',padding:'4px 0',minWidth:130}}/>
+              style={{fontSize:14,color:expiry?C.primary:C.textMuted,fontWeight:'700',background:'transparent'}}/>
           )},
           {label:'生产日期',req:false,content:(
             <input type="date" value={prod} onChange={e=>setProd(e.target.value)}
-              style={{fontSize:14,color:prod?C.primary:C.textMuted,fontWeight:'600',
-                background:'transparent',padding:'4px 0',minWidth:130}}/>
+              style={{fontSize:14,color:prod?C.primary:C.textMuted,fontWeight:'600',background:'transparent'}}/>
           )},
           {label:'备注',req:false,content:(
             <input value={notes} onChange={e=>setNotes(e.target.value)} placeholder="可选备注…"
-              style={{border:'none',textAlign:'right',fontSize:14,color:C.textMuted,background:'transparent',flex:1}}/>
+              style={{textAlign:'right',fontSize:14,color:C.textMuted,background:'transparent',flex:1}}/>
           )},
         ].map((row,i,arr)=>(
           <div key={i} style={{display:'flex',alignItems:'center',padding:'14px 16px',
@@ -621,10 +613,9 @@ function AddScreen({onSave,onClose,editProduct=null}){
           </div>
         ))}
       </div>
-      {/* Preview */}
       {name&&daysLeft!==null&&u&&totalDays!==null&&(
         <div style={{margin:'12px 16px',background:u.bg,borderRadius:16,padding:'13px 15px',
-          border:`1px solid ${u.color}22`,display:'flex',alignItems:'center',gap:10}}>
+          display:'flex',alignItems:'center',gap:10}}>
           <FreshnessArc daysLeft={daysLeft} totalDays={totalDays} size={48}/>
           <div>
             <div style={{fontSize:12,fontWeight:'800',color:u.color,marginBottom:4}}>📅 到期提醒预览</div>
@@ -657,6 +648,13 @@ function DetailScreen({product,onBack,onDelete,onEdit}){
   const pct=Math.max(0,Math.min(100,Math.round(((td-d)/td)*100)));
   const fresh=isFresh(product.purchaseDate,product.expiryDate);
   const steps=[{l:'3个月前',days:90},{l:'2个月前',days:60},{l:'1个月前',days:30},{l:'2周前',days:14},{l:'1周前',days:7}];
+  const infoRows=[
+    {l:'购买日期',v:product.purchaseDate},
+    {l:'到期日期',v:product.expiryDate,hl:true},
+    ...(product.productionDate?[{l:'生产日期',v:product.productionDate}]:[]),
+    {l:'产品类别',v:`${CATS[product.category]||'📦'} ${CAT_LABELS[product.category]||'其他'}`},
+    ...(product.notes?[{l:'备注',v:product.notes}]:[]),
+  ];
   return(
     <div style={{flex:1,overflowY:'auto',background:C.bg}} className="fade-up">
       <div style={{background:C.surface,padding:'12px 16px',borderBottom:`1px solid ${C.border}`,
@@ -668,7 +666,6 @@ function DetailScreen({product,onBack,onDelete,onEdit}){
         <button onClick={onEdit} style={{color:C.primary,fontSize:14,fontWeight:'600',
           background:'transparent',cursor:'pointer'}}>编辑</button>
       </div>
-      {/* Hero */}
       <div style={{margin:'16px 16px 12px',background:C.surface,borderRadius:22,padding:'24px 20px',
         boxShadow:'0 2px 10px rgba(0,0,0,.07)',textAlign:'center'}}>
         <div style={{display:'flex',justifyContent:'center',marginBottom:12}}>
@@ -683,25 +680,18 @@ function DetailScreen({product,onBack,onDelete,onEdit}){
         </div>
         <div>
           <div style={{display:'flex',justifyContent:'space-between',fontSize:11,color:C.textMuted,marginBottom:5}}>
-            <span>购买日期</span>
+            <span>购买</span>
             <span style={{fontWeight:'700',color:u.color}}>已使用 {pct}% 保质期</span>
-            <span>到期日期</span>
+            <span>到期</span>
           </div>
           <div style={{height:8,borderRadius:4,background:C.border,overflow:'hidden'}}>
             <div style={{height:'100%',borderRadius:4,width:`${pct}%`,background:u.color}}/>
           </div>
         </div>
       </div>
-      {/* Info rows */}
       <div style={{margin:'0 16px 14px',background:C.surface,borderRadius:18,overflow:'hidden',
         boxShadow:'0 1px 4px rgba(0,0,0,.06)'}}>
-        {[
-          {l:'购买日期',v:product.purchaseDate},
-          {l:'到期日期',v:product.expiryDate,hl:true},
-          ...(product.productionDate?[{l:'生产日期',v:product.productionDate}]:[]),
-          {l:'产品类别',v:`${CATS[product.category]} ${CAT_LABELS[product.category]||'其他'}`},
-          ...(product.notes?[{l:'备注',v:product.notes}]:[]),
-        ].map((r,i,arr)=>(
+        {infoRows.map((r,i,arr)=>(
           <div key={i} style={{display:'flex',justifyContent:'space-between',alignItems:'center',
             padding:'13px 16px',borderBottom:i<arr.length-1?`1px solid ${C.border}`:'none'}}>
             <span style={{fontSize:15,color:C.textMuted}}>{r.l}</span>
@@ -709,7 +699,6 @@ function DetailScreen({product,onBack,onDelete,onEdit}){
           </div>
         ))}
       </div>
-      {/* Timeline */}
       <div style={{margin:'0 16px 14px'}}>
         <div style={{display:'flex',alignItems:'center',gap:6,marginBottom:9}}>
           <div style={{width:4,height:16,background:C.primary,borderRadius:2}}/>
@@ -751,7 +740,6 @@ function DetailScreen({product,onBack,onDelete,onEdit}){
           )}
         </div>
       </div>
-      {/* Actions */}
       <div style={{padding:'0 16px 32px',display:'flex',gap:10}}>
         <button onClick={onEdit} style={{flex:1,padding:'14px',background:C.surface,color:C.primary,
           border:`2px solid ${C.primary}`,borderRadius:16,fontSize:15,fontWeight:'700',cursor:'pointer'}}>编辑产品</button>
@@ -769,18 +757,14 @@ function DetailScreen({product,onBack,onDelete,onEdit}){
 
 // ─── ALERTS SCREEN ────────────────────────────────────────────────────────────
 function AlertsScreen({settings,onUpdate}){
-  const [notifBlocked,setNotifBlocked]=useState(false);
-  useEffect(()=>{
-    if('Notification'in window&&Notification.permission==='denied')setNotifBlocked(true);
-  },[]);
-
+  const [blocked,setBlocked]=useState(false);
+  useEffect(()=>{if('Notification'in window&&Notification.permission==='denied')setBlocked(true);},[]);
   function Toggle({on,onToggle}){
     return(
       <div onClick={onToggle} style={{width:50,height:30,borderRadius:15,cursor:'pointer',
         background:on?C.primary:'#CBD5E1',position:'relative',transition:'background .25s',flexShrink:0}}>
-        <div style={{position:'absolute',top:3,width:24,height:24,borderRadius:12,
-          background:'white',boxShadow:'0 1px 3px rgba(0,0,0,.25)',
-          left:on?23:3,transition:'left .25s'}}/>
+        <div style={{position:'absolute',top:3,width:24,height:24,borderRadius:12,background:'white',
+          boxShadow:'0 1px 3px rgba(0,0,0,.25)',left:on?23:3,transition:'left .25s'}}/>
       </div>
     );
   }
@@ -797,7 +781,7 @@ function AlertsScreen({settings,onUpdate}){
       </div>
     );
   }
-  function Section({title,children}){
+  function Sec({title,children}){
     return(
       <div style={{padding:'14px 16px 8px'}}>
         <div style={{fontSize:11,fontWeight:'800',color:C.textMuted,marginBottom:9,letterSpacing:.8}}>{title}</div>
@@ -813,34 +797,30 @@ function AlertsScreen({settings,onUpdate}){
         <div style={{fontSize:20,fontWeight:'800',color:C.text}}>通知提醒</div>
         <div style={{fontSize:13,color:C.textMuted,marginTop:3}}>管理您的到期提醒偏好</div>
       </div>
-      {notifBlocked&&(
-        <div style={{margin:'14px 16px 0',background:'#FEF2F2',borderRadius:14,padding:'12px 14px',
-          border:`1px solid ${C.expired}22`}}>
+      {blocked&&(
+        <div style={{margin:'14px 16px 0',background:C.expiredBg,borderRadius:14,padding:'12px 14px'}}>
           <div style={{fontSize:13,fontWeight:'600',color:C.expired,marginBottom:4}}>⚠️ 通知权限被禁止</div>
-          <div style={{fontSize:12,color:C.expired,opacity:.85}}>
-            请前往手机设置 → Safari → 通知，为此网站开启权限后重新打开应用。
-          </div>
+          <div style={{fontSize:12,color:C.expired,opacity:.85}}>请前往 设置 → Safari → 通知，为此网站开启权限。</div>
         </div>
       )}
-      {!notifBlocked&&Notification.permission!=='granted'&&(
+      {!blocked&&typeof Notification!=='undefined'&&Notification.permission!=='granted'&&(
         <div style={{margin:'14px 16px 0',background:C.primaryLight,borderRadius:14,padding:'12px 14px'}}>
           <div style={{fontSize:13,fontWeight:'600',color:C.primary,marginBottom:6}}>💡 开启通知提醒</div>
-          <button onClick={async()=>{const g=await askPerm();if(g)setNotifBlocked(false);}}
+          <button onClick={async()=>{await askPerm();}}
             style={{background:C.primary,color:'white',padding:'8px 16px',borderRadius:10,
               fontWeight:'700',fontSize:13,cursor:'pointer'}}>授予通知权限</button>
         </div>
       )}
-      <Section title="标准提醒 — 适用所有产品">
+      <Sec title="标准提醒 — 适用所有产品">
         <Row icon="📅" label="提前 3 个月" sub="首次预警通知" sk="threeMonths"/>
         <Row icon="📅" label="提前 2 个月" sk="twoMonths"/>
         <Row icon="📅" label="提前 1 个月" sk="oneMonth"/>
         <Row icon="⏰" label="提前 2 周" sk="twoWeeks"/>
         <Row icon="⚠️" label="提前 1 周" sub="最后一次常规提醒" sk="oneWeek"/>
-      </Section>
-      <Section title="新鲜食品提醒 — 保质期 ≤ 30 天">
+      </Sec>
+      <Sec title="新鲜食品提醒 — 保质期 ≤ 30 天">
         <Row icon="🥛" label="每日倒计时提醒" sub="例：「全脂牛奶 还剩 4 天到期！」" sk="daily"/>
-      </Section>
-      {/* Preview */}
+      </Sec>
       <div style={{padding:'8px 16px 24px'}}>
         <div style={{fontSize:11,fontWeight:'800',color:C.textMuted,marginBottom:9,letterSpacing:.8}}>通知样式预览</div>
         <div style={{background:'rgba(28,28,30,.92)',borderRadius:18,padding:'14px 16px',marginBottom:10}}>
@@ -857,20 +837,6 @@ function AlertsScreen({settings,onUpdate}){
             全脂牛奶 还剩 <strong style={{color:'#FCA5A5'}}>4 天</strong>到期，请尽快使用！
           </div>
         </div>
-        <div style={{background:'rgba(28,28,30,.92)',borderRadius:18,padding:'14px 16px'}}>
-          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10}}>
-            <div style={{display:'flex',alignItems:'center',gap:8}}>
-              <div style={{width:28,height:28,borderRadius:8,background:C.primary,
-                display:'flex',alignItems:'center',justifyContent:'center',fontSize:15}}>📦</div>
-              <span style={{fontSize:12,fontWeight:'700',color:'rgba(255,255,255,.7)'}}>到期追踪器</span>
-            </div>
-            <span style={{fontSize:11,color:'rgba(255,255,255,.4)'}}>3个月前</span>
-          </div>
-          <div style={{fontSize:14,fontWeight:'600',color:'white',marginBottom:3}}>📅 提前预警 — 3个月</div>
-          <div style={{fontSize:13,color:'rgba(255,255,255,.75)',lineHeight:1.5}}>
-            花生酱 将在 <strong style={{color:'#6EE7B7'}}>3 个月后</strong>到期
-          </div>
-        </div>
       </div>
     </div>
   );
@@ -878,15 +844,15 @@ function AlertsScreen({settings,onUpdate}){
 
 // ─── SETTINGS SCREEN ─────────────────────────────────────────────────────────
 function SettingsScreen({products}){
+  const expired=products.filter(p=>getDaysLeft(p.expiryDate)<0);
   function exportData(){
     const json=JSON.stringify({version:2,products,exportedAt:new Date().toISOString()},null,2);
-    const blob=new Blob([json],{type:'application/json'});
     const a=document.createElement('a');
-    a.href=URL.createObjectURL(blob);a.download='expiry-tracker-backup.json';a.click();
+    a.href=URL.createObjectURL(new Blob([json],{type:'application/json'}));
+    a.download='expiry-tracker-backup.json';a.click();
   }
   function importData(){
-    const input=document.createElement('input');
-    input.type='file';input.accept='.json';
+    const input=document.createElement('input');input.type='file';input.accept='.json';
     input.onchange=e=>{
       const file=e.target.files[0];if(!file)return;
       const reader=new FileReader();
@@ -894,17 +860,14 @@ function SettingsScreen({products}){
         try{
           const data=JSON.parse(ev.target.result);
           if(data.products&&Array.isArray(data.products)){
-            save(SK.p,data.products);
-            alert(`已恢复 ${data.products.length} 个产品，请刷新页面。`);
+            persist(SK.p,data.products);
+            alert(`已恢复 ${data.products.length} 个产品，请重新开启应用。`);
           }
-        }catch{alert('文件格式错误，请选择正确的备份文件。');}
-      };
-      reader.readAsText(file);
-    };
-    input.click();
+        }catch{alert('文件格式错误。');}
+      };reader.readAsText(file);
+    };input.click();
   }
-  const expired=products.filter(p=>getDaysLeft(p.expiryDate)<0);
-  const sections=[
+  const secs=[
     {title:'数据管理',items:[
       {icon:'📤',label:'导出数据',sub:'备份至 JSON 文件',fn:exportData},
       {icon:'📥',label:'导入数据',sub:'从备份文件恢复',fn:importData},
@@ -912,7 +875,7 @@ function SettingsScreen({products}){
     {title:'关于',items:[
       {icon:'ℹ️',label:'版本信息',sub:'到期追踪器 v2.0 · PWA'},
       {icon:'🔤',label:'输入法支持',sub:'✅ 支持中文、English 输入'},
-      {icon:'📱',label:'离线使用',sub:'✅ 无需网络，数据存储在本机'},
+      {icon:'📱',label:'数据存储',sub:'✅ IndexedDB · 本机持久化'},
     ]},
   ];
   return(
@@ -921,8 +884,8 @@ function SettingsScreen({products}){
         <div style={{fontSize:20,fontWeight:'800',color:C.text}}>设置</div>
       </div>
       <div style={{padding:'14px 16px'}}>
-        <div style={{background:C.surface,borderRadius:18,padding:'16px',boxShadow:'0 1px 4px rgba(0,0,0,.06)',
-          marginBottom:14,display:'flex',alignItems:'center',gap:14}}>
+        <div style={{background:C.surface,borderRadius:18,padding:'16px',
+          boxShadow:'0 1px 4px rgba(0,0,0,.06)',marginBottom:14,display:'flex',alignItems:'center',gap:14}}>
           <div style={{width:56,height:56,borderRadius:28,background:C.primaryLight,
             display:'flex',alignItems:'center',justifyContent:'center',fontSize:26}}>👤</div>
           <div>
@@ -932,7 +895,6 @@ function SettingsScreen({products}){
             </div>
           </div>
         </div>
-        {/* Stats grid */}
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:14}}>
           {[
             {l:'全部产品',v:products.length,c:C.primary},
@@ -947,7 +909,7 @@ function SettingsScreen({products}){
             </div>
           ))}
         </div>
-        {sections.map(sec=>(
+        {secs.map(sec=>(
           <div key={sec.title} style={{marginBottom:14}}>
             <div style={{fontSize:11,fontWeight:'800',color:C.textMuted,marginBottom:8,letterSpacing:.8}}>{sec.title}</div>
             <div style={{background:C.surface,borderRadius:18,overflow:'hidden',boxShadow:'0 1px 4px rgba(0,0,0,.06)'}}>
@@ -973,99 +935,108 @@ function SettingsScreen({products}){
 
 // ─── APP ROOT ─────────────────────────────────────────────────────────────────
 function App(){
-  const [products,setProducts]=useState(()=>load(SK.p,[]));
-  const [settings,setSettings]=useState(()=>load(SK.s,DEF_SETTINGS));
+  const [products,setProducts]=useState([]);
+  const [settings,setSettings]=useState(DEF_SETTINGS);
+  const [ready,setReady]=useState(false);   // waits for IDB load before rendering
   const [screen,setScreen]=useState('home');
   const [selected,setSelected]=useState(null);
   const [editing,setEditing]=useState(null);
 
-  // ── Direct save helpers ───────────────────────────────────────────────────
-  // Rule: compute new state FIRST → localStorage.setItem() → then setProducts().
-  // Never call save() inside a React setState updater — React 18 automatic
-  // batching may defer the updater to the next microtask, leaving a window
-  // where iOS can terminate the process before the write completes.
+  // ── Load from IndexedDB on startup (more reliable than localStorage on iOS) ──
+  useEffect(()=>{
+    Promise.all([loadData(SK.p,[]),loadData(SK.s,DEF_SETTINGS)])
+      .then(([prods,setts])=>{
+        setProducts(prods);
+        setSettings(setts);
+        setReady(true);
+      })
+      .catch(()=>{
+        // Absolute fallback — use localStorage directly
+        setProducts(lsGet(SK.p,[]));
+        setSettings(lsGet(SK.s,DEF_SETTINGS));
+        setReady(true);
+      });
 
+    // Service worker registration
+    if('serviceWorker'in navigator){
+      navigator.serviceWorker.register('sw.js').catch(()=>{});
+    }
+  },[]);
+
+  // ── Notification check once products are loaded ───────────────────────────
+  useEffect(()=>{
+    if(!ready||products.length===0)return;
+    askPerm().then(ok=>{if(ok)runNotifCheck(products,settings);});
+  },[ready]);
+
+  // ── Refs for the background flush (always sees latest state) ─────────────
+  const prodRef=useRef(products);
+  const settRef=useRef(settings);
+  useEffect(()=>{prodRef.current=products;},[products]);
+  useEffect(()=>{settRef.current=settings;},[settings]);
+
+  // ── Flush both storages when iOS backgrounds or kills the app ────────────
+  useEffect(()=>{
+    function flush(){
+      persist(SK.p,prodRef.current);
+      persist(SK.s,settRef.current);
+    }
+    document.addEventListener('visibilitychange',()=>{if(document.hidden)flush();});
+    window.addEventListener('pagehide',flush);
+  },[]);
+
+  // ── Mutations — compute → persist → setState (never persist inside updater)
   function addProd(data){
     const p={id:uid(),createdAt:new Date().toISOString(),...data};
     const next=[...products,p];
-    save(SK.p,next);          // ← synchronous disk write
-    setProducts(next);         // ← then tell React
+    persist(SK.p,next);
+    setProducts(next);
   }
   function editProd(id,data){
     const next=products.map(p=>p.id===id?{...p,...data}:p);
-    save(SK.p,next);
+    persist(SK.p,next);
     setProducts(next);
   }
   function removeProd(id){
     const next=products.filter(p=>p.id!==id);
-    save(SK.p,next);
+    persist(SK.p,next);
     setProducts(next);
   }
-  function saveSetting(k,v){
+  function updateSetting(k,v){
     const next={...settings,[k]:v};
-    save(SK.s,next);
+    persist(SK.s,next);
     setSettings(next);
   }
-
-  // Keep refs in sync so the visibilitychange handler always sees latest data
-  const productsRef=useRef(products);
-  const settingsRef=useRef(settings);
-  useEffect(()=>{productsRef.current=products;},[products]);
-  useEffect(()=>{settingsRef.current=settings;},[settings]);
-
-  // One-time setup: SW registration + notification check + background flush
-  useEffect(()=>{
-    // Service worker
-    if('serviceWorker'in navigator){
-      navigator.serviceWorker.register('sw.js').catch(()=>{});
-    }
-    // Notifications
-    askPerm().then(ok=>{
-      if(ok)runNotifCheck(productsRef.current,settingsRef.current);
-    });
-    // Flush to localStorage the instant iOS moves the app to background.
-    // Uses refs so we always write the latest state, not a stale closure.
-    function flush(){
-      if(document.visibilityState==='hidden'){
-        save(SK.p,productsRef.current);
-        save(SK.s,settingsRef.current);
-      }
-    }
-    document.addEventListener('visibilitychange',flush);
-    window.addEventListener('pagehide',flush);
-    return()=>{
-      document.removeEventListener('visibilitychange',flush);
-      window.removeEventListener('pagehide',flush);
-    };
-  },[]);  // ← empty deps: register once, refs keep it current
 
   function handleSave(data,editId){
     if(editId){
       editProd(editId,data);
       setEditing(null);
-      if(selected&&selected.id===editId)setSelected(s=>({...s,...data}));
+      if(selected?.id===editId)setSelected(s=>({...s,...data}));
       setScreen(selected?'detail':'products');
     }else{
       addProd(data);
     }
   }
-  function handleDelete(id){
-    removeProd(id);
-    setSelected(null);setEditing(null);setScreen('products');
-  }
+  function handleDelete(id){removeProd(id);setSelected(null);setEditing(null);setScreen('products');}
   function handleProduct(p){setSelected(p);setScreen('detail');}
   function handleEdit(){setEditing(selected);setScreen('edit');}
-  function updateSetting(k,v){saveSetting(k,v);}
+  function navigate(s){if(s!=='detail'&&s!=='edit'){setSelected(null);setEditing(null);}setScreen(s);}
 
-  function navigate(s){
-    if(s!=='detail'&&s!=='edit'){setSelected(null);setEditing(null);}
-    setScreen(s);
-  }
+  // ── Loading screen while IDB initialises ─────────────────────────────────
+  if(!ready)return(
+    <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',
+      justifyContent:'center',background:C.bg,gap:16}}>
+      <div style={{fontSize:52}}>📦</div>
+      <div className="spin" style={{width:28,height:28,border:`3px solid ${C.border}`,
+        borderTopColor:C.primary,borderRadius:'50%'}}/>
+      <div style={{fontSize:14,color:C.textMuted}}>加载中…</div>
+    </div>
+  );
 
   const showTab=!['detail','edit'].includes(screen);
-
   return(
-    <div style={{display:'flex',flexDirection:'column',height:'100%',background:C.bg,overflow:'hidden'}}>
+    <div style={{display:'flex',flexDirection:'column',height:'100%',overflow:'hidden'}}>
       <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden'}}>
         {screen==='home'&&<HomeScreen products={products} onProduct={handleProduct}/>}
         {screen==='products'&&<ProductsScreen products={products} onProduct={handleProduct}/>}
