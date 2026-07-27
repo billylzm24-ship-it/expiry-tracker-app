@@ -41,10 +41,30 @@ input[type="date"]::-webkit-calendar-picker-indicator{opacity:.6;cursor:pointer;
 </head>
 <body>
 <div id="root"><div id="shell"></div></div>
+
+<script>
+// ── Service worker: register the network-only SW that clears old caches ──────
+// Must run before Babel/React so the stale SW is replaced as early as possible.
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+
+// ── Storage health check ─────────────────────────────────────────────────────
+// Detects Private Browsing (where localStorage is blocked) before React boots.
+window.__STORAGE_OK = (function(){
+  try {
+    localStorage.setItem('__et_test__', '1');
+    const ok = localStorage.getItem('__et_test__') === '1';
+    localStorage.removeItem('__et_test__');
+    return ok;
+  } catch { return false; }
+})();
+</script>
+
 <script type="text/babel">
 const {useState,useEffect,useRef,useMemo}=React;
 
-// ─── TOKENS ──────────────────────────────────────────────────────────────────
+// ─── DESIGN TOKENS ───────────────────────────────────────────────────────────
 const C={
   primary:'#0F766E',primaryDark:'#0D5F59',primaryLight:'#CCFBF1',primaryMid:'#14B8A6',
   expired:'#DC2626',expiredBg:'#FEF2F2',
@@ -58,8 +78,36 @@ const C={
 const CATS={dairy:'🥛',medicine:'💊',food:'🥫',beauty:'🧴',other:'📦'};
 const CAT_LABELS={dairy:'乳制品',medicine:'药品',food:'食品',beauty:'美妆',other:'其他'};
 const CAT_LIST=['food','dairy','medicine','beauty','other'];
-const SK={p:'et-v2-products',s:'et-v2-settings',n:'et-v2-notifs'};
 const DEF_SETTINGS={threeMonths:true,twoMonths:true,oneMonth:true,twoWeeks:true,oneWeek:true,daily:true};
+
+// ─── STORAGE ─────────────────────────────────────────────────────────────────
+// Synchronous only. No IndexedDB. No async. No race conditions.
+// Key is versioned so old data never bleeds in.
+const KEY_P='et3-products';
+const KEY_S='et3-settings';
+
+function readStorage(key, defaultVal) {
+  if (!window.__STORAGE_OK) return defaultVal;
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return defaultVal;
+    const parsed = JSON.parse(raw);
+    // Sanity check: products must be an array
+    if (key === KEY_P && !Array.isArray(parsed)) return defaultVal;
+    return parsed;
+  } catch { return defaultVal; }
+}
+
+function writeStorage(key, value) {
+  if (!window.__STORAGE_OK) return false;
+  try {
+    const json = JSON.stringify(value);
+    localStorage.setItem(key, json);
+    // Immediately verify the write succeeded
+    const verify = localStorage.getItem(key);
+    return verify === json;
+  } catch { return false; }
+}
 
 // ─── UTILS ───────────────────────────────────────────────────────────────────
 function getDaysLeft(exp){
@@ -79,63 +127,6 @@ function urgency(d){
 function todayStr(){return new Date().toISOString().split('T')[0];}
 function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2);}
 
-// ─── STORAGE — IndexedDB primary, localStorage fallback ───────────────────────
-// IndexedDB survives iOS force-close; localStorage can be silently discarded.
-
-let _idb=null;
-function openIDB(){
-  if(_idb)return Promise.resolve(_idb);
-  return new Promise((res,rej)=>{
-    const r=indexedDB.open('expiry-tracker-db',1);
-    r.onupgradeneeded=e=>e.target.result.createObjectStore('kv');
-    r.onsuccess=e=>{_idb=e.target.result;res(_idb);};
-    r.onerror=()=>rej(r.error);
-  });
-}
-async function idbGet(key){
-  try{
-    const db=await openIDB();
-    return new Promise((res,rej)=>{
-      const req=db.transaction('kv','readonly').objectStore('kv').get(key);
-      req.onsuccess=()=>res(req.result??null);
-      req.onerror=()=>rej(req.error);
-    });
-  }catch{return null;}
-}
-async function idbSet(key,value){
-  try{
-    const db=await openIDB();
-    return new Promise((res,rej)=>{
-      const tx=db.transaction('kv','readwrite');
-      tx.objectStore('kv').put(value,key);
-      tx.oncomplete=res;
-      tx.onerror=()=>rej(tx.error);
-    });
-  }catch{}
-}
-function lsGet(k,def){try{const v=localStorage.getItem(k);return v?JSON.parse(v):def;}catch{return def;}}
-function lsSet(k,v){try{localStorage.setItem(k,JSON.stringify(v));}catch{}}
-
-// Write to BOTH storages; IDB is async (fire-and-forget for speed)
-function persist(key,value){
-  lsSet(key,value);         // synchronous backup
-  idbSet(key,value);        // durable async primary
-}
-
-// Load: IDB first (most reliable), fallback to localStorage, migrate if needed
-async function loadData(key,def){
-  const idbVal=await idbGet(key);
-  if(idbVal!==null){
-    lsSet(key,idbVal); // keep localStorage in sync
-    return idbVal;
-  }
-  const lsVal=lsGet(key,def);
-  if(JSON.stringify(lsVal)!==JSON.stringify(def)){
-    idbSet(key,lsVal); // migrate existing localStorage data into IDB
-  }
-  return lsVal;
-}
-
 // ─── NOTIFICATIONS ────────────────────────────────────────────────────────────
 async function askPerm(){
   if(!('Notification'in window))return false;
@@ -147,12 +138,13 @@ function fireNotif(title,body,tag){
   try{new Notification(title,{body,tag,icon:'icons/icon-192.png'});}catch{}
 }
 function runNotifCheck(products,settings){
-  const log=lsGet(SK.n,{});const td=todayStr();
+  const log=readStorage('et3-notifs',{});
+  const td=todayStr();
   products.forEach(p=>{
     const d=getDaysLeft(p.expiryDate);
     if(isFresh(p.purchaseDate,p.expiryDate)&&settings.daily&&d>=0&&d<=29){
       const k=`d|${p.id}|${td}`;
-      if(!log[k]){fireNotif('⚡ 新鲜食品提醒',`${p.name} 还剩 ${d} 天到期，请尽快使用！`,k);log[k]=1;}
+      if(!log[k]){fireNotif('⚡ 新鲜食品提醒',`${p.name} 还剩 ${d} 天到期！`,k);log[k]=1;}
     }
     [{days:90,sk:'threeMonths',t:'📅 提前预警 — 3个月',b:`${p.name} 将在约3个月后到期`},
      {days:60,sk:'twoMonths',  t:'📅 提前预警 — 2个月',b:`${p.name} 将在约2个月后到期`},
@@ -167,13 +159,13 @@ function runNotifCheck(products,settings){
       }
     });
   });
-  lsSet(SK.n,log);
+  writeStorage('et3-notifs',log);
 }
 
 // ─── OPEN FOOD FACTS ─────────────────────────────────────────────────────────
 async function lookupBarcode(barcode){
   const r=await fetch(`https://world.openfoodfacts.org/api/v2/product/${barcode}.json?fields=product_name,product_name_zh,brands,categories_tags`,
-    {headers:{'User-Agent':'ExpiryTracker-PWA/2.0'}});
+    {headers:{'User-Agent':'ExpiryTracker-PWA/3.0'}});
   const data=await r.json();
   if(data.status!==1||!data.product)throw new Error('not found');
   const p=data.product;
@@ -182,7 +174,7 @@ async function lookupBarcode(barcode){
   const tags=(p.categories_tags||[]).join(' ');
   const cat=/dairies|milks?|yogurt|cheese/i.test(tags)?'dairy':
              /medicine|drug|pharma/i.test(tags)?'medicine':
-             /beauty|cosmetic|skincare/i.test(tags)?'beauty':'food';
+             /beauty|cosmetic/i.test(tags)?'beauty':'food';
   return{name,brand:p.brands?p.brands.split(',')[0].trim():undefined,category:cat,barcode};
 }
 
@@ -242,8 +234,7 @@ function TabBar({current,onNav}){
   ];
   return(
     <div style={{display:'flex',borderTop:`1px solid ${C.border}`,
-      background:'rgba(255,255,255,.97)',backdropFilter:'blur(20px)',
-      paddingBottom:'env(safe-area-inset-bottom,8px)',flexShrink:0}}>
+      background:'rgba(255,255,255,.97)',paddingBottom:'env(safe-area-inset-bottom,8px)',flexShrink:0}}>
       {tabs.map(t=>{
         if(t.id==='add')return(
           <button key="add" onClick={()=>onNav('add')} style={{flex:1,background:'transparent',
@@ -267,8 +258,24 @@ function TabBar({current,onNav}){
   );
 }
 
+// ─── PRIVATE BROWSING BANNER ─────────────────────────────────────────────────
+function StorageWarning(){
+  return(
+    <div style={{margin:'12px 16px 0',background:'#FEF2F2',borderRadius:14,padding:'12px 14px',
+      border:'1px solid #DC262622'}}>
+      <div style={{fontSize:14,fontWeight:'700',color:'#DC2626',marginBottom:4}}>
+        ⚠️ 隐私浏览模式已开启
+      </div>
+      <div style={{fontSize:13,color:'#DC2626',lineHeight:1.6}}>
+        检测到存储不可用（可能是隐私浏览模式）。关闭后台再打开时，记录将会消失。{'\n'}
+        请关闭隐私浏览，或从主屏幕图标（而非 Safari）打开此应用。
+      </div>
+    </div>
+  );
+}
+
 // ─── HOME SCREEN ─────────────────────────────────────────────────────────────
-function HomeScreen({products,onProduct}){
+function HomeScreen({products,onProduct,storageOk}){
   const expired=products.filter(p=>getDaysLeft(p.expiryDate)<0);
   const critical=products.filter(p=>{const d=getDaysLeft(p.expiryDate);return d>=0&&d<=7;});
   const urgent=[...expired,...critical];
@@ -308,6 +315,7 @@ function HomeScreen({products,onProduct}){
           ))}
         </div>
       </div>
+      {!storageOk&&<StorageWarning/>}
       <div style={{padding:'16px 16px 24px'}}>
         {products.length===0&&(
           <div style={{textAlign:'center',padding:'60px 20px',color:C.textMuted}}>
@@ -402,50 +410,50 @@ function BarcodeScanner({onResult,onClose}){
   const [errMsg,setErrMsg]=useState('');
   const streamRef=useRef(null);
   const rafRef=useRef(null);
-  const detectorRef=useRef(null);
+  const activeRef=useRef(true);
   useEffect(()=>{
-    let cancelled=false;
     async function start(){
       try{
         const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
         streamRef.current=stream;
-        if(cancelled){stream.getTracks().forEach(t=>t.stop());return;}
+        if(!activeRef.current){stream.getTracks().forEach(t=>t.stop());return;}
         if(videoRef.current){videoRef.current.srcObject=stream;await videoRef.current.play();}
         if('BarcodeDetector'in window){
-          detectorRef.current=new BarcodeDetector({formats:['ean_13','ean_8','upc_a','upc_e','code_128','qr_code']});
+          const det=new BarcodeDetector({formats:['ean_13','ean_8','upc_a','upc_e','code_128','qr_code']});
+          const scan=async()=>{
+            if(!activeRef.current)return;
+            if(videoRef.current?.readyState===4){
+              try{
+                const codes=await det.detect(videoRef.current);
+                if(codes.length>0&&activeRef.current){
+                  activeRef.current=false;
+                  setStatus('loading');
+                  try{const p=await lookupBarcode(codes[0].rawValue);stop();onResult(p);}
+                  catch{setStatus('notfound');setErrMsg(codes[0].rawValue);activeRef.current=false;}
+                  return;
+                }
+              }catch{}
+            }
+            rafRef.current=requestAnimationFrame(scan);
+          };
           scan();
         }else{
-          setStatus('error');setErrMsg('您的浏览器暂不支持条形码扫描。\n请升级至 iOS 17+ 或使用 Chrome 浏览器。');
+          setStatus('error');setErrMsg('您的浏览器暂不支持条形码扫描。请升级至 iOS 17+。');
         }
-      }catch{setStatus('error');setErrMsg('无法访问相机。\n请在设置中允许浏览器使用相机。');}
-    }
-    async function scan(){
-      if(cancelled)return;
-      if(videoRef.current?.readyState===4){
-        try{
-          const codes=await detectorRef.current.detect(videoRef.current);
-          if(codes.length>0&&!cancelled){await handleCode(codes[0].rawValue);return;}
-        }catch{}
-      }
-      rafRef.current=requestAnimationFrame(scan);
-    }
-    async function handleCode(code){
-      setStatus('loading');
-      try{const p=await lookupBarcode(code);stop();onResult(p);}
-      catch{setStatus('notfound');setErrMsg(code);}
+      }catch{setStatus('error');setErrMsg('无法访问相机。请在设置中允许浏览器使用相机。');}
     }
     start();
-    return()=>{cancelled=true;if(rafRef.current)cancelAnimationFrame(rafRef.current);stop();};
+    return()=>{activeRef.current=false;if(rafRef.current)cancelAnimationFrame(rafRef.current);stop();};
   },[]);
-  function stop(){if(streamRef.current)streamRef.current.getTracks().forEach(t=>t.stop());}
+  function stop(){if(streamRef.current){streamRef.current.getTracks().forEach(t=>t.stop());streamRef.current=null;}}
   return(
-    <div style={{position:'absolute',inset:0,zIndex:100,background:'#000',display:'flex',flexDirection:'column'}}>
+    <div style={{position:'absolute',inset:0,zIndex:100,background:'#000'}}>
       <video ref={videoRef} style={{position:'absolute',inset:0,width:'100%',height:'100%',objectFit:'cover'}} playsInline muted/>
       <div style={{position:'absolute',inset:0,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center'}}>
         <div style={{position:'absolute',top:0,left:0,right:0,height:'30%',background:'rgba(0,0,0,.6)'}}/>
-        <div style={{position:'absolute',bottom:0,left:0,right:0,height:'32%',background:'rgba(0,0,0,.6)'}}/>
-        <div style={{position:'absolute',top:'30%',bottom:'32%',left:0,width:'calc(50% - 130px)',background:'rgba(0,0,0,.6)'}}/>
-        <div style={{position:'absolute',top:'30%',bottom:'32%',right:0,width:'calc(50% - 130px)',background:'rgba(0,0,0,.6)'}}/>
+        <div style={{position:'absolute',bottom:0,left:0,right:0,height:'33%',background:'rgba(0,0,0,.6)'}}/>
+        <div style={{position:'absolute',top:'30%',bottom:'33%',left:0,width:'calc(50% - 130px)',background:'rgba(0,0,0,.6)'}}/>
+        <div style={{position:'absolute',top:'30%',bottom:'33%',right:0,width:'calc(50% - 130px)',background:'rgba(0,0,0,.6)'}}/>
         <div style={{width:260,height:240,position:'relative',zIndex:1}}>
           {[['0','0','borderTop','borderLeft'],['0','auto','borderTop','borderRight'],
             ['auto','0','borderBottom','borderLeft'],['auto','auto','borderBottom','borderRight']].map(([t,r,b1,b2],i)=>(
@@ -464,30 +472,30 @@ function BarcodeScanner({onResult,onClose}){
             </div>
           )}
         </div>
-        <div style={{position:'absolute',bottom:0,left:0,right:0,padding:'24px',
-          display:'flex',flexDirection:'column',alignItems:'center',gap:12}}>
-          {status==='scanning'&&<>
-            <span style={{color:'rgba(255,255,255,.9)',fontSize:14,fontWeight:'600'}}>将条形码对准扫描框</span>
-            <span style={{color:'rgba(255,255,255,.4)',fontSize:11}}>支持 EAN-13 · UPC · QR</span>
-          </>}
-          {status==='notfound'&&<>
-            <span style={{color:'white',fontSize:13,textAlign:'center'}}>未找到产品 #{errMsg}</span>
-            <div style={{display:'flex',gap:10}}>
-              <button onClick={()=>setStatus('scanning')} style={{background:C.primary,color:'white',
-                padding:'10px 20px',borderRadius:12,fontWeight:'700',cursor:'pointer',fontSize:14}}>重新扫描</button>
-              <button onClick={()=>{stop();onResult({name:'',category:'food',barcode:errMsg});}}
-                style={{background:'rgba(255,255,255,.15)',color:'white',
-                  padding:'10px 20px',borderRadius:12,fontWeight:'700',cursor:'pointer',fontSize:14}}>手动输入</button>
+        <div style={{position:'absolute',bottom:0,left:0,right:0,padding:'20px',
+          display:'flex',flexDirection:'column',alignItems:'center',gap:10}}>
+          {status==='scanning'&&<span style={{color:'rgba(255,255,255,.9)',fontSize:14,fontWeight:'600'}}>将条形码对准扫描框</span>}
+          {status==='notfound'&&(
+            <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:10}}>
+              <span style={{color:'white',fontSize:13}}>未找到产品 #{errMsg}</span>
+              <div style={{display:'flex',gap:10}}>
+                <button onClick={()=>{activeRef.current=true;setStatus('scanning');}} style={{background:C.primary,
+                  color:'white',padding:'10px 20px',borderRadius:12,fontWeight:'700',cursor:'pointer',fontSize:14}}>重新扫描</button>
+                <button onClick={()=>{stop();onResult({name:'',category:'food',barcode:errMsg});}}
+                  style={{background:'rgba(255,255,255,.15)',color:'white',padding:'10px 20px',
+                    borderRadius:12,fontWeight:'700',cursor:'pointer',fontSize:14}}>手动输入</button>
+              </div>
             </div>
-          </>}
-          {status==='error'&&<>
-            <span style={{color:'white',fontSize:13,textAlign:'center',lineHeight:1.6,whiteSpace:'pre-line'}}>{errMsg}</span>
-            <button onClick={()=>{stop();onResult({name:'',category:'food'});}}
-              style={{background:'rgba(255,255,255,.15)',color:'white',
-                padding:'10px 24px',borderRadius:12,fontWeight:'700',cursor:'pointer',fontSize:14}}>手动输入</button>
-          </>}
+          )}
+          {status==='error'&&(
+            <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:10}}>
+              <span style={{color:'white',fontSize:13,textAlign:'center',lineHeight:1.5}}>{errMsg}</span>
+              <button onClick={()=>{stop();onResult({name:'',category:'food'});}} style={{background:'rgba(255,255,255,.15)',
+                color:'white',padding:'10px 24px',borderRadius:12,fontWeight:'700',cursor:'pointer',fontSize:14}}>手动输入</button>
+            </div>
+          )}
           <button onClick={()=>{stop();onClose();}} style={{background:'rgba(255,255,255,.12)',
-            color:'white',padding:'10px 32px',borderRadius:22,fontWeight:'600',cursor:'pointer',fontSize:15,marginTop:4}}>取消</button>
+            color:'white',padding:'10px 32px',borderRadius:22,fontWeight:'600',cursor:'pointer',fontSize:15}}>取消</button>
         </div>
       </div>
     </div>
@@ -510,21 +518,25 @@ function AddScreen({onSave,onClose,editProduct=null}){
   const totalDays=expiry?getTotalDays(purchase,expiry):null;
   const u=daysLeft!==null?urgency(daysLeft):null;
   const canSave=name.trim()&&expiry;
+
   function handleScanResult(result){
     setScanning(false);
     if(result.name)setName(result.name);
     if(result.category)setCat(result.category);
   }
-  async function handleSave(){
+  function handleSave(){
     if(!canSave)return;
     setSaving(true);
-    await new Promise(r=>setTimeout(r,150));
-    onSave({name:name.trim(),category:cat,purchaseDate:purchase,
-      expiryDate:expiry,productionDate:prod||undefined,notes:notes.trim()||undefined},
-      editing?editProduct.id:null);
-    if(!editing){setSaved(true);setSaving(false);}
+    // Small timeout so the button feedback renders before we do the work
+    setTimeout(()=>{
+      onSave({name:name.trim(),category:cat,purchaseDate:purchase,
+        expiryDate:expiry,productionDate:prod||undefined,notes:notes.trim()||undefined},
+        editing?editProduct.id:null);
+      if(!editing){setSaved(true);setSaving(false);}
+    },100);
   }
   function reset(){setName('');setCat('food');setPurchase(todayStr());setExpiry('');setProd('');setNotes('');setSaved(false);}
+
   if(scanning)return <BarcodeScanner onResult={handleScanResult} onClose={()=>setScanning(false)}/>;
   if(saved)return(
     <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',
@@ -540,7 +552,7 @@ function AddScreen({onSave,onClose,editProduct=null}){
   return(
     <div style={{flex:1,overflowY:'auto',background:C.bg}} className="fade-up">
       <div style={{background:C.surface,borderBottom:`1px solid ${C.border}`,
-        padding:'14px 16px 12px',display:'flex',alignItems:'center',justifyContent:'space-between'}}>
+        padding:'14px 16px 12px',display:'flex',alignItems:'center'}}>
         {editing&&<button onClick={onClose} style={{color:C.primary,fontSize:15,fontWeight:'600',
           background:'transparent',cursor:'pointer',marginRight:12}}>‹ 取消</button>}
         <div style={{flex:1}}>
@@ -648,13 +660,6 @@ function DetailScreen({product,onBack,onDelete,onEdit}){
   const pct=Math.max(0,Math.min(100,Math.round(((td-d)/td)*100)));
   const fresh=isFresh(product.purchaseDate,product.expiryDate);
   const steps=[{l:'3个月前',days:90},{l:'2个月前',days:60},{l:'1个月前',days:30},{l:'2周前',days:14},{l:'1周前',days:7}];
-  const infoRows=[
-    {l:'购买日期',v:product.purchaseDate},
-    {l:'到期日期',v:product.expiryDate,hl:true},
-    ...(product.productionDate?[{l:'生产日期',v:product.productionDate}]:[]),
-    {l:'产品类别',v:`${CATS[product.category]||'📦'} ${CAT_LABELS[product.category]||'其他'}`},
-    ...(product.notes?[{l:'备注',v:product.notes}]:[]),
-  ];
   return(
     <div style={{flex:1,overflowY:'auto',background:C.bg}} className="fade-up">
       <div style={{background:C.surface,padding:'12px 16px',borderBottom:`1px solid ${C.border}`,
@@ -672,7 +677,7 @@ function DetailScreen({product,onBack,onDelete,onEdit}){
           <FreshnessArc daysLeft={d} totalDays={td} size={96}/>
         </div>
         <div style={{fontSize:38,marginBottom:6}}>{CATS[product.category]||'📦'}</div>
-        <div style={{fontSize:22,fontWeight:'800',color:C.text,marginBottom:10,letterSpacing:-.3}}>{product.name}</div>
+        <div style={{fontSize:22,fontWeight:'800',color:C.text,marginBottom:10}}>{product.name}</div>
         <div style={{background:u.bg,color:u.color,display:'inline-flex',alignItems:'center',gap:6,
           padding:'8px 18px',borderRadius:30,fontSize:14,fontWeight:'700',marginBottom:12}}>
           <div style={{width:8,height:8,borderRadius:'50%',background:u.color}}/>
@@ -691,7 +696,11 @@ function DetailScreen({product,onBack,onDelete,onEdit}){
       </div>
       <div style={{margin:'0 16px 14px',background:C.surface,borderRadius:18,overflow:'hidden',
         boxShadow:'0 1px 4px rgba(0,0,0,.06)'}}>
-        {infoRows.map((r,i,arr)=>(
+        {[{l:'购买日期',v:product.purchaseDate},{l:'到期日期',v:product.expiryDate,hl:true},
+          ...(product.productionDate?[{l:'生产日期',v:product.productionDate}]:[]),
+          {l:'产品类别',v:`${CATS[product.category]||'📦'} ${CAT_LABELS[product.category]||'其他'}`},
+          ...(product.notes?[{l:'备注',v:product.notes}]:[]),
+        ].map((r,i,arr)=>(
           <div key={i} style={{display:'flex',justifyContent:'space-between',alignItems:'center',
             padding:'13px 16px',borderBottom:i<arr.length-1?`1px solid ${C.border}`:'none'}}>
             <span style={{fontSize:15,color:C.textMuted}}>{r.l}</span>
@@ -800,15 +809,14 @@ function AlertsScreen({settings,onUpdate}){
       {blocked&&(
         <div style={{margin:'14px 16px 0',background:C.expiredBg,borderRadius:14,padding:'12px 14px'}}>
           <div style={{fontSize:13,fontWeight:'600',color:C.expired,marginBottom:4}}>⚠️ 通知权限被禁止</div>
-          <div style={{fontSize:12,color:C.expired,opacity:.85}}>请前往 设置 → Safari → 通知，为此网站开启权限。</div>
+          <div style={{fontSize:12,color:C.expired}}>请前往 设置 → Safari → 通知，为此网站开启权限。</div>
         </div>
       )}
       {!blocked&&typeof Notification!=='undefined'&&Notification.permission!=='granted'&&(
         <div style={{margin:'14px 16px 0',background:C.primaryLight,borderRadius:14,padding:'12px 14px'}}>
           <div style={{fontSize:13,fontWeight:'600',color:C.primary,marginBottom:6}}>💡 开启通知提醒</div>
-          <button onClick={async()=>{await askPerm();}}
-            style={{background:C.primary,color:'white',padding:'8px 16px',borderRadius:10,
-              fontWeight:'700',fontSize:13,cursor:'pointer'}}>授予通知权限</button>
+          <button onClick={async()=>await askPerm()} style={{background:C.primary,color:'white',
+            padding:'8px 16px',borderRadius:10,fontWeight:'700',fontSize:13,cursor:'pointer'}}>授予通知权限</button>
         </div>
       )}
       <Sec title="标准提醒 — 适用所有产品">
@@ -823,7 +831,7 @@ function AlertsScreen({settings,onUpdate}){
       </Sec>
       <div style={{padding:'8px 16px 24px'}}>
         <div style={{fontSize:11,fontWeight:'800',color:C.textMuted,marginBottom:9,letterSpacing:.8}}>通知样式预览</div>
-        <div style={{background:'rgba(28,28,30,.92)',borderRadius:18,padding:'14px 16px',marginBottom:10}}>
+        <div style={{background:'rgba(28,28,30,.92)',borderRadius:18,padding:'14px 16px'}}>
           <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10}}>
             <div style={{display:'flex',alignItems:'center',gap:8}}>
               <div style={{width:28,height:28,borderRadius:8,background:C.primary,
@@ -843,10 +851,10 @@ function AlertsScreen({settings,onUpdate}){
 }
 
 // ─── SETTINGS SCREEN ─────────────────────────────────────────────────────────
-function SettingsScreen({products}){
+function SettingsScreen({products,storageOk}){
   const expired=products.filter(p=>getDaysLeft(p.expiryDate)<0);
   function exportData(){
-    const json=JSON.stringify({version:2,products,exportedAt:new Date().toISOString()},null,2);
+    const json=JSON.stringify({version:3,products,exportedAt:new Date().toISOString()},null,2);
     const a=document.createElement('a');
     a.href=URL.createObjectURL(new Blob([json],{type:'application/json'}));
     a.download='expiry-tracker-backup.json';a.click();
@@ -859,25 +867,18 @@ function SettingsScreen({products}){
       reader.onload=ev=>{
         try{
           const data=JSON.parse(ev.target.result);
-          if(data.products&&Array.isArray(data.products)){
-            persist(SK.p,data.products);
-            alert(`已恢复 ${data.products.length} 个产品，请重新开启应用。`);
-          }
+          const list=data.products||data; // support both formats
+          if(Array.isArray(list)){
+            writeStorage(KEY_P,list);
+            alert(`已恢复 ${list.length} 个产品，请重新开启应用。`);
+          }else{alert('文件格式错误。');}
         }catch{alert('文件格式错误。');}
       };reader.readAsText(file);
     };input.click();
   }
-  const secs=[
-    {title:'数据管理',items:[
-      {icon:'📤',label:'导出数据',sub:'备份至 JSON 文件',fn:exportData},
-      {icon:'📥',label:'导入数据',sub:'从备份文件恢复',fn:importData},
-    ]},
-    {title:'关于',items:[
-      {icon:'ℹ️',label:'版本信息',sub:'到期追踪器 v2.0 · PWA'},
-      {icon:'🔤',label:'输入法支持',sub:'✅ 支持中文、English 输入'},
-      {icon:'📱',label:'数据存储',sub:'✅ IndexedDB · 本机持久化'},
-    ]},
-  ];
+  const storageStatus=storageOk
+    ?{icon:'✅',label:'存储正常',sub:'数据已安全保存至本机',color:C.safe}
+    :{icon:'⚠️',label:'存储不可用',sub:'请关闭隐私浏览模式后使用',color:C.expired};
   return(
     <div style={{flex:1,overflowY:'auto',background:C.bg}} className="fade-up">
       <div style={{background:C.surface,borderBottom:`1px solid ${C.border}`,padding:'14px 16px 12px'}}>
@@ -895,6 +896,19 @@ function SettingsScreen({products}){
             </div>
           </div>
         </div>
+
+        {/* Storage status — prominently shown */}
+        <div style={{background:C.surface,borderRadius:18,overflow:'hidden',
+          boxShadow:'0 1px 4px rgba(0,0,0,.06)',marginBottom:14}}>
+          <div style={{display:'flex',alignItems:'center',gap:12,padding:'14px 16px'}}>
+            <span style={{fontSize:20}}>{storageStatus.icon}</span>
+            <div style={{flex:1}}>
+              <div style={{fontSize:15,fontWeight:'600',color:storageStatus.color}}>{storageStatus.label}</div>
+              <div style={{fontSize:12,color:C.textMuted,marginTop:2}}>{storageStatus.sub}</div>
+            </div>
+          </div>
+        </div>
+
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:14}}>
           {[
             {l:'全部产品',v:products.length,c:C.primary},
@@ -909,25 +923,42 @@ function SettingsScreen({products}){
             </div>
           ))}
         </div>
-        {secs.map(sec=>(
-          <div key={sec.title} style={{marginBottom:14}}>
-            <div style={{fontSize:11,fontWeight:'800',color:C.textMuted,marginBottom:8,letterSpacing:.8}}>{sec.title}</div>
-            <div style={{background:C.surface,borderRadius:18,overflow:'hidden',boxShadow:'0 1px 4px rgba(0,0,0,.06)'}}>
-              {sec.items.map((item,i)=>(
-                <div key={i} onClick={item.fn} style={{display:'flex',alignItems:'center',gap:12,
-                  padding:'13px 16px',borderBottom:i<sec.items.length-1?`1px solid ${C.border}`:'none',
-                  cursor:item.fn?'pointer':'default'}}>
-                  <span style={{fontSize:18}}>{item.icon}</span>
-                  <div style={{flex:1}}>
-                    <div style={{fontSize:15,fontWeight:'500',color:C.text}}>{item.label}</div>
-                    {item.sub&&<div style={{fontSize:12,color:C.textMuted,marginTop:2}}>{item.sub}</div>}
-                  </div>
-                  {item.fn&&<span style={{fontSize:15,color:C.textMuted}}>›</span>}
-                </div>
-              ))}
+
+        <div style={{fontSize:11,fontWeight:'800',color:C.textMuted,marginBottom:8,letterSpacing:.8}}>数据管理</div>
+        <div style={{background:C.surface,borderRadius:18,overflow:'hidden',
+          boxShadow:'0 1px 4px rgba(0,0,0,.06)',marginBottom:14}}>
+          {[
+            {icon:'📤',label:'导出数据',sub:'备份至 JSON 文件',fn:exportData},
+            {icon:'📥',label:'导入数据',sub:'从备份文件恢复',fn:importData},
+          ].map((item,i)=>(
+            <div key={i} onClick={item.fn} style={{display:'flex',alignItems:'center',gap:12,
+              padding:'13px 16px',borderBottom:i===0?`1px solid ${C.border}`:'none',cursor:'pointer'}}>
+              <span style={{fontSize:18}}>{item.icon}</span>
+              <div style={{flex:1}}>
+                <div style={{fontSize:15,fontWeight:'500',color:C.text}}>{item.label}</div>
+                <div style={{fontSize:12,color:C.textMuted,marginTop:2}}>{item.sub}</div>
+              </div>
+              <span style={{fontSize:15,color:C.textMuted}}>›</span>
             </div>
-          </div>
-        ))}
+          ))}
+        </div>
+
+        <div style={{fontSize:11,fontWeight:'800',color:C.textMuted,marginBottom:8,letterSpacing:.8}}>关于</div>
+        <div style={{background:C.surface,borderRadius:18,overflow:'hidden',boxShadow:'0 1px 4px rgba(0,0,0,.06)'}}>
+          {[
+            {icon:'ℹ️',label:'版本信息',sub:'到期追踪器 v3.0 · PWA'},
+            {icon:'🔤',label:'输入法支持',sub:'✅ 支持中文、English 输入'},
+          ].map((item,i)=>(
+            <div key={i} style={{display:'flex',alignItems:'center',gap:12,
+              padding:'13px 16px',borderBottom:i===0?`1px solid ${C.border}`:'none'}}>
+              <span style={{fontSize:18}}>{item.icon}</span>
+              <div style={{flex:1}}>
+                <div style={{fontSize:15,fontWeight:'500',color:C.text}}>{item.label}</div>
+                <div style={{fontSize:12,color:C.textMuted,marginTop:2}}>{item.sub}</div>
+              </div>
+            </div>
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -935,76 +966,45 @@ function SettingsScreen({products}){
 
 // ─── APP ROOT ─────────────────────────────────────────────────────────────────
 function App(){
-  const [products,setProducts]=useState([]);
-  const [settings,setSettings]=useState(DEF_SETTINGS);
-  const [ready,setReady]=useState(false);   // waits for IDB load before rendering
-  const [screen,setScreen]=useState('home');
-  const [selected,setSelected]=useState(null);
-  const [editing,setEditing]=useState(null);
+  const storageOk = window.__STORAGE_OK;
 
-  // ── Load from IndexedDB on startup (more reliable than localStorage on iOS) ──
+  // ── Load synchronously from localStorage — no async, no race conditions ──
+  const [products, setProducts] = useState(() => readStorage(KEY_P, []));
+  const [settings, setSettings] = useState(() => readStorage(KEY_S, DEF_SETTINGS));
+  const [screen,   setScreen]   = useState('home');
+  const [selected, setSelected] = useState(null);
+  const [editing,  setEditing]  = useState(null);
+
+  // ── Notification check on first load ────────────────────────────────────
   useEffect(()=>{
-    Promise.all([loadData(SK.p,[]),loadData(SK.s,DEF_SETTINGS)])
-      .then(([prods,setts])=>{
-        setProducts(prods);
-        setSettings(setts);
-        setReady(true);
-      })
-      .catch(()=>{
-        // Absolute fallback — use localStorage directly
-        setProducts(lsGet(SK.p,[]));
-        setSettings(lsGet(SK.s,DEF_SETTINGS));
-        setReady(true);
-      });
-
-    // Service worker registration
-    if('serviceWorker'in navigator){
-      navigator.serviceWorker.register('sw.js').catch(()=>{});
+    if(products.length>0){
+      askPerm().then(ok=>{ if(ok) runNotifCheck(products,settings); });
     }
   },[]);
 
-  // ── Notification check once products are loaded ───────────────────────────
-  useEffect(()=>{
-    if(!ready||products.length===0)return;
-    askPerm().then(ok=>{if(ok)runNotifCheck(products,settings);});
-  },[ready]);
+  // ── Mutations: compute → writeStorage → setState ─────────────────────────
+  // writeStorage is synchronous. State update follows immediately after.
+  // This is the ONLY place data is written — simple, auditable, reliable.
 
-  // ── Refs for the background flush (always sees latest state) ─────────────
-  const prodRef=useRef(products);
-  const settRef=useRef(settings);
-  useEffect(()=>{prodRef.current=products;},[products]);
-  useEffect(()=>{settRef.current=settings;},[settings]);
-
-  // ── Flush both storages when iOS backgrounds or kills the app ────────────
-  useEffect(()=>{
-    function flush(){
-      persist(SK.p,prodRef.current);
-      persist(SK.s,settRef.current);
-    }
-    document.addEventListener('visibilitychange',()=>{if(document.hidden)flush();});
-    window.addEventListener('pagehide',flush);
-  },[]);
-
-  // ── Mutations — compute → persist → setState (never persist inside updater)
   function addProd(data){
     const p={id:uid(),createdAt:new Date().toISOString(),...data};
     const next=[...products,p];
-    persist(SK.p,next);
+    writeStorage(KEY_P,next);
     setProducts(next);
   }
   function editProd(id,data){
     const next=products.map(p=>p.id===id?{...p,...data}:p);
-    persist(SK.p,next);
+    writeStorage(KEY_P,next);
     setProducts(next);
   }
   function removeProd(id){
     const next=products.filter(p=>p.id!==id);
-    persist(SK.p,next);
+    writeStorage(KEY_P,next);
     setProducts(next);
   }
   function updateSetting(k,v){
     const next={...settings,[k]:v};
-    persist(SK.s,next);
+    writeStorage(KEY_S,next);
     setSettings(next);
   }
 
@@ -1023,29 +1023,18 @@ function App(){
   function handleEdit(){setEditing(selected);setScreen('edit');}
   function navigate(s){if(s!=='detail'&&s!=='edit'){setSelected(null);setEditing(null);}setScreen(s);}
 
-  // ── Loading screen while IDB initialises ─────────────────────────────────
-  if(!ready)return(
-    <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',
-      justifyContent:'center',background:C.bg,gap:16}}>
-      <div style={{fontSize:52}}>📦</div>
-      <div className="spin" style={{width:28,height:28,border:`3px solid ${C.border}`,
-        borderTopColor:C.primary,borderRadius:'50%'}}/>
-      <div style={{fontSize:14,color:C.textMuted}}>加载中…</div>
-    </div>
-  );
-
   const showTab=!['detail','edit'].includes(screen);
   return(
     <div style={{display:'flex',flexDirection:'column',height:'100%',overflow:'hidden'}}>
       <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden'}}>
-        {screen==='home'&&<HomeScreen products={products} onProduct={handleProduct}/>}
+        {screen==='home'    &&<HomeScreen products={products} onProduct={handleProduct} storageOk={storageOk}/>}
         {screen==='products'&&<ProductsScreen products={products} onProduct={handleProduct}/>}
-        {screen==='add'&&<AddScreen onSave={handleSave} onClose={()=>navigate('home')}/>}
-        {screen==='edit'&&editing&&<AddScreen editProduct={editing} onSave={handleSave} onClose={()=>navigate('detail')}/>}
-        {screen==='detail'&&selected&&<DetailScreen product={selected} onBack={()=>navigate('products')}
+        {screen==='add'     &&<AddScreen onSave={handleSave} onClose={()=>navigate('home')}/>}
+        {screen==='edit'    &&editing&&<AddScreen editProduct={editing} onSave={handleSave} onClose={()=>navigate('detail')}/>}
+        {screen==='detail'  &&selected&&<DetailScreen product={selected} onBack={()=>navigate('products')}
           onDelete={handleDelete} onEdit={handleEdit}/>}
-        {screen==='alerts'&&<AlertsScreen settings={settings} onUpdate={updateSetting}/>}
-        {screen==='settings'&&<SettingsScreen products={products}/>}
+        {screen==='alerts'  &&<AlertsScreen settings={settings} onUpdate={updateSetting}/>}
+        {screen==='settings'&&<SettingsScreen products={products} storageOk={storageOk}/>}
       </div>
       {showTab&&<TabBar current={screen} onNav={navigate}/>}
     </div>
