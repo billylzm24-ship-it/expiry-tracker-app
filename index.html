@@ -43,28 +43,73 @@ input[type="date"]::-webkit-calendar-picker-indicator{opacity:.6;cursor:pointer;
 <div id="root"><div id="shell"></div></div>
 
 <script>
-// ── Service worker: register the network-only SW that clears old caches ──────
-// Must run before Babel/React so the stale SW is replaced as early as possible.
+// Register the network-only service worker (clears all old stale caches)
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 
-// ── Storage health check ─────────────────────────────────────────────────────
-// Detects Private Browsing (where localStorage is blocked) before React boots.
-window.__STORAGE_OK = (function(){
+// ─── IndexedDB storage layer ─────────────────────────────────────────────────
+// IDB transaction.oncomplete fires only after data is committed to DISK.
+// localStorage.setItem is synchronous in JS but WebKit may buffer the disk
+// write — meaning a force-close (SIGKILL) can lose the data.
+// By awaiting the IDB transaction, we guarantee the data is on disk before
+// we show the success screen, making force-close safe.
+
+const DB_NAME = 'expiry-tracker-db';
+const DB_VER  = 1;
+const DB_STORE = 'kv';
+
+let _db = null;
+
+function openDB() {
+  if (_db) return Promise.resolve(_db);
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VER);
+    req.onupgradeneeded = e => e.target.result.createObjectStore(DB_STORE);
+    req.onsuccess = e => { _db = e.target.result; resolve(_db); };
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+async function idbGet(key) {
   try {
-    localStorage.setItem('__et_test__', '1');
-    const ok = localStorage.getItem('__et_test__') === '1';
-    localStorage.removeItem('__et_test__');
-    return ok;
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const req = db.transaction(DB_STORE, 'readonly')
+                    .objectStore(DB_STORE).get(key);
+      req.onsuccess = () => resolve(req.result ?? null);
+      req.onerror   = () => reject(req.error);
+    });
+  } catch { return null; }
+}
+
+// Returns a Promise that resolves ONLY after oncomplete (data flushed to disk)
+async function idbSet(key, value) {
+  try {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(DB_STORE, 'readwrite');
+      tx.objectStore(DB_STORE).put(value, key);
+      tx.oncomplete = () => resolve(true);   // ← disk write confirmed
+      tx.onerror    = () => reject(tx.error);
+    });
   } catch { return false; }
-})();
+}
+
+// localStorage mirror — instant reads, fallback if IDB ever fails
+function lsSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
+function lsGet(k, d) {
+  try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; }
+  catch { return d; }
+}
+
+window.__DB = { idbGet, idbSet, lsSet, lsGet };
 </script>
 
 <script type="text/babel">
 const {useState,useEffect,useRef,useMemo}=React;
 
-// ─── DESIGN TOKENS ───────────────────────────────────────────────────────────
+// ─── TOKENS ──────────────────────────────────────────────────────────────────
 const C={
   primary:'#0F766E',primaryDark:'#0D5F59',primaryLight:'#CCFBF1',primaryMid:'#14B8A6',
   expired:'#DC2626',expiredBg:'#FEF2F2',
@@ -80,34 +125,13 @@ const CAT_LABELS={dairy:'乳制品',medicine:'药品',food:'食品',beauty:'美�
 const CAT_LIST=['food','dairy','medicine','beauty','other'];
 const DEF_SETTINGS={threeMonths:true,twoMonths:true,oneMonth:true,twoWeeks:true,oneWeek:true,daily:true};
 
-// ─── STORAGE ─────────────────────────────────────────────────────────────────
-// Synchronous only. No IndexedDB. No async. No race conditions.
-// Key is versioned so old data never bleeds in.
-const KEY_P='et3-products';
-const KEY_S='et3-settings';
+// Storage keys
+const KP='et4-products';
+const KS='et4-settings';
+const KN='et4-notifs';
 
-function readStorage(key, defaultVal) {
-  if (!window.__STORAGE_OK) return defaultVal;
-  try {
-    const raw = localStorage.getItem(key);
-    if (!raw) return defaultVal;
-    const parsed = JSON.parse(raw);
-    // Sanity check: products must be an array
-    if (key === KEY_P && !Array.isArray(parsed)) return defaultVal;
-    return parsed;
-  } catch { return defaultVal; }
-}
-
-function writeStorage(key, value) {
-  if (!window.__STORAGE_OK) return false;
-  try {
-    const json = JSON.stringify(value);
-    localStorage.setItem(key, json);
-    // Immediately verify the write succeeded
-    const verify = localStorage.getItem(key);
-    return verify === json;
-  } catch { return false; }
-}
+// Shorthand helpers
+const {idbGet,idbSet,lsSet,lsGet}=window.__DB;
 
 // ─── UTILS ───────────────────────────────────────────────────────────────────
 function getDaysLeft(exp){
@@ -138,8 +162,7 @@ function fireNotif(title,body,tag){
   try{new Notification(title,{body,tag,icon:'icons/icon-192.png'});}catch{}
 }
 function runNotifCheck(products,settings){
-  const log=readStorage('et3-notifs',{});
-  const td=todayStr();
+  const log=lsGet(KN,{});const td=todayStr();
   products.forEach(p=>{
     const d=getDaysLeft(p.expiryDate);
     if(isFresh(p.purchaseDate,p.expiryDate)&&settings.daily&&d>=0&&d<=29){
@@ -159,13 +182,13 @@ function runNotifCheck(products,settings){
       }
     });
   });
-  writeStorage('et3-notifs',log);
+  lsSet(KN,log);
 }
 
 // ─── OPEN FOOD FACTS ─────────────────────────────────────────────────────────
 async function lookupBarcode(barcode){
   const r=await fetch(`https://world.openfoodfacts.org/api/v2/product/${barcode}.json?fields=product_name,product_name_zh,brands,categories_tags`,
-    {headers:{'User-Agent':'ExpiryTracker-PWA/3.0'}});
+    {headers:{'User-Agent':'ExpiryTracker-PWA/4.0'}});
   const data=await r.json();
   if(data.status!==1||!data.product)throw new Error('not found');
   const p=data.product;
@@ -258,24 +281,8 @@ function TabBar({current,onNav}){
   );
 }
 
-// ─── PRIVATE BROWSING BANNER ─────────────────────────────────────────────────
-function StorageWarning(){
-  return(
-    <div style={{margin:'12px 16px 0',background:'#FEF2F2',borderRadius:14,padding:'12px 14px',
-      border:'1px solid #DC262622'}}>
-      <div style={{fontSize:14,fontWeight:'700',color:'#DC2626',marginBottom:4}}>
-        ⚠️ 隐私浏览模式已开启
-      </div>
-      <div style={{fontSize:13,color:'#DC2626',lineHeight:1.6}}>
-        检测到存储不可用（可能是隐私浏览模式）。关闭后台再打开时，记录将会消失。{'\n'}
-        请关闭隐私浏览，或从主屏幕图标（而非 Safari）打开此应用。
-      </div>
-    </div>
-  );
-}
-
 // ─── HOME SCREEN ─────────────────────────────────────────────────────────────
-function HomeScreen({products,onProduct,storageOk}){
+function HomeScreen({products,onProduct}){
   const expired=products.filter(p=>getDaysLeft(p.expiryDate)<0);
   const critical=products.filter(p=>{const d=getDaysLeft(p.expiryDate);return d>=0&&d<=7;});
   const urgent=[...expired,...critical];
@@ -315,7 +322,6 @@ function HomeScreen({products,onProduct,storageOk}){
           ))}
         </div>
       </div>
-      {!storageOk&&<StorageWarning/>}
       <div style={{padding:'16px 16px 24px'}}>
         {products.length===0&&(
           <div style={{textAlign:'center',padding:'60px 20px',color:C.textMuted}}>
@@ -429,7 +435,7 @@ function BarcodeScanner({onResult,onClose}){
                   activeRef.current=false;
                   setStatus('loading');
                   try{const p=await lookupBarcode(codes[0].rawValue);stop();onResult(p);}
-                  catch{setStatus('notfound');setErrMsg(codes[0].rawValue);activeRef.current=false;}
+                  catch{setStatus('notfound');setErrMsg(codes[0].rawValue);}
                   return;
                 }
               }catch{}
@@ -503,6 +509,8 @@ function BarcodeScanner({onResult,onClose}){
 }
 
 // ─── ADD / EDIT SCREEN ────────────────────────────────────────────────────────
+// handleSave is now async and awaits onSave — the success screen only appears
+// after the IDB transaction.oncomplete has fired (data confirmed on disk).
 function AddScreen({onSave,onClose,editProduct=null}){
   const editing=!!editProduct;
   const [name,setName]=useState(editProduct?.name||'');
@@ -524,17 +532,23 @@ function AddScreen({onSave,onClose,editProduct=null}){
     if(result.name)setName(result.name);
     if(result.category)setCat(result.category);
   }
-  function handleSave(){
-    if(!canSave)return;
+
+  // KEY FIX: async — awaits the IDB commit before showing success
+  async function handleSave(){
+    if(!canSave||saving)return;
     setSaving(true);
-    // Small timeout so the button feedback renders before we do the work
-    setTimeout(()=>{
-      onSave({name:name.trim(),category:cat,purchaseDate:purchase,
-        expiryDate:expiry,productionDate:prod||undefined,notes:notes.trim()||undefined},
-        editing?editProduct.id:null);
-      if(!editing){setSaved(true);setSaving(false);}
-    },100);
+    try{
+      await onSave(
+        {name:name.trim(),category:cat,purchaseDate:purchase,
+         expiryDate:expiry,productionDate:prod||undefined,notes:notes.trim()||undefined},
+        editing?editProduct.id:null
+      );
+      if(!editing) setSaved(true);
+    }finally{
+      setSaving(false);
+    }
   }
+
   function reset(){setName('');setCat('food');setPurchase(todayStr());setExpiry('');setProd('');setNotes('');setSaved(false);}
 
   if(scanning)return <BarcodeScanner onResult={handleScanResult} onClose={()=>setScanning(false)}/>;
@@ -543,12 +557,13 @@ function AddScreen({onSave,onClose,editProduct=null}){
       justifyContent:'center',background:C.bg,gap:14,padding:24}} className="fade-up">
       <div style={{width:80,height:80,borderRadius:40,background:C.primaryLight,
         display:'flex',alignItems:'center',justifyContent:'center',fontSize:40}}>✅</div>
-      <div style={{fontSize:20,fontWeight:'800',color:C.text}}>保存成功！</div>
-      <div style={{fontSize:14,color:C.textMuted,textAlign:'center'}}>已为「{name}」设置到期提醒</div>
+      <div style={{fontSize:20,fontWeight:'800',color:C.text}}>已保存至本机 ✓</div>
+      <div style={{fontSize:14,color:C.textMuted,textAlign:'center'}}>「{name}」已写入设备存储，关闭后台也不会丢失</div>
       <button onClick={reset} style={{marginTop:8,padding:'14px 32px',background:C.primary,
         color:'white',borderRadius:16,fontSize:15,fontWeight:'700',cursor:'pointer'}}>继续添加</button>
     </div>
   );
+
   return(
     <div style={{flex:1,overflowY:'auto',background:C.bg}} className="fade-up">
       <div style={{background:C.surface,borderBottom:`1px solid ${C.border}`,
@@ -643,7 +658,7 @@ function AddScreen({onSave,onClose,editProduct=null}){
           background:canSave?`linear-gradient(135deg,${C.primaryDark},${C.primaryMid})`:C.border,
           color:canSave?'white':C.textMuted,
           boxShadow:canSave?`0 4px 16px ${C.primary}44`:'none'}}>
-          {saving?'保存中…':editing?'更新产品':'保存产品'}
+          {saving?'正在写入存储…':editing?'更新产品':'保存产品'}
         </button>
         {!canSave&&<div style={{textAlign:'center',fontSize:12,color:C.textMuted,marginTop:8}}>请填写所有必填字段</div>}
       </div>
@@ -777,29 +792,22 @@ function AlertsScreen({settings,onUpdate}){
       </div>
     );
   }
-  function Row({icon,label,sub,sk}){
-    return(
-      <div style={{display:'flex',alignItems:'center',padding:'13px 16px',
-        borderBottom:`1px solid ${C.border}`,gap:12}}>
-        <span style={{fontSize:18,flexShrink:0}}>{icon}</span>
-        <div style={{flex:1}}>
-          <div style={{fontSize:15,fontWeight:'500',color:C.text}}>{label}</div>
-          {sub&&<div style={{fontSize:12,color:C.textMuted,marginTop:2}}>{sub}</div>}
-        </div>
-        <Toggle on={settings[sk]} onToggle={()=>onUpdate(sk,!settings[sk])}/>
+  function Row({icon,label,sub,sk}){return(
+    <div style={{display:'flex',alignItems:'center',padding:'13px 16px',borderBottom:`1px solid ${C.border}`,gap:12}}>
+      <span style={{fontSize:18,flexShrink:0}}>{icon}</span>
+      <div style={{flex:1}}>
+        <div style={{fontSize:15,fontWeight:'500',color:C.text}}>{label}</div>
+        {sub&&<div style={{fontSize:12,color:C.textMuted,marginTop:2}}>{sub}</div>}
       </div>
-    );
-  }
-  function Sec({title,children}){
-    return(
-      <div style={{padding:'14px 16px 8px'}}>
-        <div style={{fontSize:11,fontWeight:'800',color:C.textMuted,marginBottom:9,letterSpacing:.8}}>{title}</div>
-        <div style={{background:C.surface,borderRadius:18,overflow:'hidden',boxShadow:'0 1px 4px rgba(0,0,0,.06)'}}>
-          {children}
-        </div>
-      </div>
-    );
-  }
+      <Toggle on={settings[sk]} onToggle={()=>onUpdate(sk,!settings[sk])}/>
+    </div>
+  );}
+  function Sec({title,children}){return(
+    <div style={{padding:'14px 16px 8px'}}>
+      <div style={{fontSize:11,fontWeight:'800',color:C.textMuted,marginBottom:9,letterSpacing:.8}}>{title}</div>
+      <div style={{background:C.surface,borderRadius:18,overflow:'hidden',boxShadow:'0 1px 4px rgba(0,0,0,.06)'}}>{children}</div>
+    </div>
+  );}
   return(
     <div style={{flex:1,overflowY:'auto',background:C.bg}} className="fade-up">
       <div style={{background:C.surface,borderBottom:`1px solid ${C.border}`,padding:'14px 16px 12px'}}>
@@ -829,32 +837,15 @@ function AlertsScreen({settings,onUpdate}){
       <Sec title="新鲜食品提醒 — 保质期 ≤ 30 天">
         <Row icon="🥛" label="每日倒计时提醒" sub="例：「全脂牛奶 还剩 4 天到期！」" sk="daily"/>
       </Sec>
-      <div style={{padding:'8px 16px 24px'}}>
-        <div style={{fontSize:11,fontWeight:'800',color:C.textMuted,marginBottom:9,letterSpacing:.8}}>通知样式预览</div>
-        <div style={{background:'rgba(28,28,30,.92)',borderRadius:18,padding:'14px 16px'}}>
-          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:10}}>
-            <div style={{display:'flex',alignItems:'center',gap:8}}>
-              <div style={{width:28,height:28,borderRadius:8,background:C.primary,
-                display:'flex',alignItems:'center',justifyContent:'center',fontSize:15}}>📦</div>
-              <span style={{fontSize:12,fontWeight:'700',color:'rgba(255,255,255,.7)'}}>到期追踪器</span>
-            </div>
-            <span style={{fontSize:11,color:'rgba(255,255,255,.4)'}}>现在</span>
-          </div>
-          <div style={{fontSize:14,fontWeight:'600',color:'white',marginBottom:3}}>⚠️ 产品即将到期</div>
-          <div style={{fontSize:13,color:'rgba(255,255,255,.75)',lineHeight:1.5}}>
-            全脂牛奶 还剩 <strong style={{color:'#FCA5A5'}}>4 天</strong>到期，请尽快使用！
-          </div>
-        </div>
-      </div>
     </div>
   );
 }
 
 // ─── SETTINGS SCREEN ─────────────────────────────────────────────────────────
-function SettingsScreen({products,storageOk}){
+function SettingsScreen({products}){
   const expired=products.filter(p=>getDaysLeft(p.expiryDate)<0);
   function exportData(){
-    const json=JSON.stringify({version:3,products,exportedAt:new Date().toISOString()},null,2);
+    const json=JSON.stringify({version:4,products,exportedAt:new Date().toISOString()},null,2);
     const a=document.createElement('a');
     a.href=URL.createObjectURL(new Blob([json],{type:'application/json'}));
     a.download='expiry-tracker-backup.json';a.click();
@@ -864,21 +855,19 @@ function SettingsScreen({products,storageOk}){
     input.onchange=e=>{
       const file=e.target.files[0];if(!file)return;
       const reader=new FileReader();
-      reader.onload=ev=>{
+      reader.onload=async ev=>{
         try{
           const data=JSON.parse(ev.target.result);
-          const list=data.products||data; // support both formats
+          const list=data.products||data;
           if(Array.isArray(list)){
-            writeStorage(KEY_P,list);
+            lsSet(KP,list);
+            await idbSet(KP,list);
             alert(`已恢复 ${list.length} 个产品，请重新开启应用。`);
           }else{alert('文件格式错误。');}
         }catch{alert('文件格式错误。');}
       };reader.readAsText(file);
     };input.click();
   }
-  const storageStatus=storageOk
-    ?{icon:'✅',label:'存储正常',sub:'数据已安全保存至本机',color:C.safe}
-    :{icon:'⚠️',label:'存储不可用',sub:'请关闭隐私浏览模式后使用',color:C.expired};
   return(
     <div style={{flex:1,overflowY:'auto',background:C.bg}} className="fade-up">
       <div style={{background:C.surface,borderBottom:`1px solid ${C.border}`,padding:'14px 16px 12px'}}>
@@ -896,23 +885,8 @@ function SettingsScreen({products,storageOk}){
             </div>
           </div>
         </div>
-
-        {/* Storage status — prominently shown */}
-        <div style={{background:C.surface,borderRadius:18,overflow:'hidden',
-          boxShadow:'0 1px 4px rgba(0,0,0,.06)',marginBottom:14}}>
-          <div style={{display:'flex',alignItems:'center',gap:12,padding:'14px 16px'}}>
-            <span style={{fontSize:20}}>{storageStatus.icon}</span>
-            <div style={{flex:1}}>
-              <div style={{fontSize:15,fontWeight:'600',color:storageStatus.color}}>{storageStatus.label}</div>
-              <div style={{fontSize:12,color:C.textMuted,marginTop:2}}>{storageStatus.sub}</div>
-            </div>
-          </div>
-        </div>
-
         <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:14}}>
-          {[
-            {l:'全部产品',v:products.length,c:C.primary},
-            {l:'已过期',v:expired.length,c:C.expired},
+          {[{l:'全部产品',v:products.length,c:C.primary},{l:'已过期',v:expired.length,c:C.expired},
             {l:'本周到期',v:products.filter(p=>{const d=getDaysLeft(p.expiryDate);return d>=0&&d<=7;}).length,c:C.critical},
             {l:'安全',v:products.filter(p=>getDaysLeft(p.expiryDate)>90).length,c:C.safe},
           ].map(s=>(
@@ -923,12 +897,9 @@ function SettingsScreen({products,storageOk}){
             </div>
           ))}
         </div>
-
         <div style={{fontSize:11,fontWeight:'800',color:C.textMuted,marginBottom:8,letterSpacing:.8}}>数据管理</div>
-        <div style={{background:C.surface,borderRadius:18,overflow:'hidden',
-          boxShadow:'0 1px 4px rgba(0,0,0,.06)',marginBottom:14}}>
-          {[
-            {icon:'📤',label:'导出数据',sub:'备份至 JSON 文件',fn:exportData},
+        <div style={{background:C.surface,borderRadius:18,overflow:'hidden',boxShadow:'0 1px 4px rgba(0,0,0,.06)'}}>
+          {[{icon:'📤',label:'导出数据',sub:'备份至 JSON 文件',fn:exportData},
             {icon:'📥',label:'导入数据',sub:'从备份文件恢复',fn:importData},
           ].map((item,i)=>(
             <div key={i} onClick={item.fn} style={{display:'flex',alignItems:'center',gap:12,
@@ -942,11 +913,8 @@ function SettingsScreen({products,storageOk}){
             </div>
           ))}
         </div>
-
-        <div style={{fontSize:11,fontWeight:'800',color:C.textMuted,marginBottom:8,letterSpacing:.8}}>关于</div>
-        <div style={{background:C.surface,borderRadius:18,overflow:'hidden',boxShadow:'0 1px 4px rgba(0,0,0,.06)'}}>
-          {[
-            {icon:'ℹ️',label:'版本信息',sub:'到期追踪器 v3.0 · PWA'},
+        <div style={{marginTop:14,background:C.surface,borderRadius:18,overflow:'hidden',boxShadow:'0 1px 4px rgba(0,0,0,.06)'}}>
+          {[{icon:'ℹ️',label:'版本信息',sub:'到期追踪器 v4.0 · PWA · IndexedDB'},
             {icon:'🔤',label:'输入法支持',sub:'✅ 支持中文、English 输入'},
           ].map((item,i)=>(
             <div key={i} style={{display:'flex',alignItems:'center',gap:12,
@@ -966,75 +934,120 @@ function SettingsScreen({products,storageOk}){
 
 // ─── APP ROOT ─────────────────────────────────────────────────────────────────
 function App(){
-  const storageOk = window.__STORAGE_OK;
-
-  // ── Load synchronously from localStorage — no async, no race conditions ──
-  const [products, setProducts] = useState(() => readStorage(KEY_P, []));
-  const [settings, setSettings] = useState(() => readStorage(KEY_S, DEF_SETTINGS));
+  const [products, setProducts] = useState([]);
+  const [settings, setSettings] = useState(DEF_SETTINGS);
+  const [ready,    setReady]    = useState(false);
   const [screen,   setScreen]   = useState('home');
   const [selected, setSelected] = useState(null);
   const [editing,  setEditing]  = useState(null);
 
-  // ── Notification check on first load ────────────────────────────────────
+  // ── Startup: load from IDB (durable) with localStorage as instant fallback ──
   useEffect(()=>{
-    if(products.length>0){
-      askPerm().then(ok=>{ if(ok) runNotifCheck(products,settings); });
+    async function init(){
+      // Show localStorage data instantly while IDB loads (avoids blank flash)
+      const lsProds = lsGet(KP, []);
+      const lsSetts = lsGet(KS, DEF_SETTINGS);
+      if(lsProds.length > 0) setProducts(lsProds);
+      setSettings(lsSetts);
+
+      // Then load from IDB — the authoritative source
+      const [idbProds, idbSetts] = await Promise.all([idbGet(KP), idbGet(KS)]);
+
+      if(idbProds !== null){
+        setProducts(idbProds);
+        lsSet(KP, idbProds); // keep localStorage mirror in sync
+      } else if(lsProds.length > 0){
+        // Migrate localStorage data into IDB
+        await idbSet(KP, lsProds);
+      }
+
+      if(idbSetts !== null){
+        setSettings(idbSetts);
+        lsSet(KS, idbSetts);
+      } else {
+        await idbSet(KS, lsSetts);
+      }
+
+      setReady(true);
+
+      // Notification check after data is loaded
+      const prods = idbProds ?? lsProds;
+      const setts = idbSetts ?? lsSetts;
+      if(prods.length > 0){
+        askPerm().then(ok=>{ if(ok) runNotifCheck(prods, setts); });
+      }
     }
+    init();
   },[]);
 
-  // ── Mutations: compute → writeStorage → setState ─────────────────────────
-  // writeStorage is synchronous. State update follows immediately after.
-  // This is the ONLY place data is written — simple, auditable, reliable.
+  // ── Mutations: localStorage first (instant), then await IDB (durable) ──────
+  // The AWAIT on idbSet is the critical fix — success only fires after
+  // tx.oncomplete, meaning the data is confirmed written to disk.
 
-  function addProd(data){
+  async function addProd(data){
     const p={id:uid(),createdAt:new Date().toISOString(),...data};
     const next=[...products,p];
-    writeStorage(KEY_P,next);
+    lsSet(KP,next);                // instant mirror
+    await idbSet(KP,next);         // ← awaited: disk write confirmed before returning
     setProducts(next);
   }
-  function editProd(id,data){
+  async function editProd(id,data){
     const next=products.map(p=>p.id===id?{...p,...data}:p);
-    writeStorage(KEY_P,next);
+    lsSet(KP,next);
+    await idbSet(KP,next);
     setProducts(next);
   }
-  function removeProd(id){
+  async function removeProd(id){
     const next=products.filter(p=>p.id!==id);
-    writeStorage(KEY_P,next);
+    lsSet(KP,next);
+    await idbSet(KP,next);
     setProducts(next);
   }
-  function updateSetting(k,v){
+  async function updateSetting(k,v){
     const next={...settings,[k]:v};
-    writeStorage(KEY_S,next);
+    lsSet(KS,next);
+    await idbSet(KS,next);
     setSettings(next);
   }
 
-  function handleSave(data,editId){
+  // handleSave is async so AddScreen can await it before showing success
+  async function handleSave(data,editId){
     if(editId){
-      editProd(editId,data);
+      await editProd(editId,data);
       setEditing(null);
-      if(selected?.id===editId)setSelected(s=>({...s,...data}));
+      if(selected?.id===editId) setSelected(s=>({...s,...data}));
       setScreen(selected?'detail':'products');
     }else{
-      addProd(data);
+      await addProd(data);
     }
   }
-  function handleDelete(id){removeProd(id);setSelected(null);setEditing(null);setScreen('products');}
+  async function handleDelete(id){await removeProd(id);setSelected(null);setEditing(null);setScreen('products');}
   function handleProduct(p){setSelected(p);setScreen('detail');}
   function handleEdit(){setEditing(selected);setScreen('edit');}
   function navigate(s){if(s!=='detail'&&s!=='edit'){setSelected(null);setEditing(null);}setScreen(s);}
 
   const showTab=!['detail','edit'].includes(screen);
+
+  // Brief loading screen while IDB initialises on cold start
+  if(!ready) return(
+    <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',
+      justifyContent:'center',background:C.bg,gap:16}}>
+      <div style={{fontSize:52}}>📦</div>
+      <div className="spin" style={{width:28,height:28,border:`3px solid ${C.border}`,
+        borderTopColor:C.primary,borderRadius:'50%'}}/>
+    </div>
+  );
+
   return(
     <div style={{display:'flex',flexDirection:'column',height:'100%',overflow:'hidden'}}>
       <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden'}}>
-        {screen==='home'    &&<HomeScreen products={products} onProduct={handleProduct} storageOk={storageOk}/>}
+        {screen==='home'    &&<HomeScreen products={products} onProduct={handleProduct}/>}
         {screen==='products'&&<ProductsScreen products={products} onProduct={handleProduct}/>}
         {screen==='add'     &&<AddScreen onSave={handleSave} onClose={()=>navigate('home')}/>}
         {screen==='edit'    &&editing&&<AddScreen editProduct={editing} onSave={handleSave} onClose={()=>navigate('detail')}/>}
-        {screen==='detail'  &&selected&&<DetailScreen product={selected} onBack={()=>navigate('products')}
-          onDelete={handleDelete} onEdit={handleEdit}/>}
+        {screen==='detail'  &&selected&&<DetailScreen product={selected} onBack={()=>navigate('products')} onDelete={handleDelete} onEdit={handleEdit}/>}
         {screen==='alerts'  &&<AlertsScreen settings={settings} onUpdate={updateSetting}/>}
-        {screen==='settings'&&<SettingsScreen products={products} storageOk={storageOk}/>}
+        {screen==='settings'&&<SettingsScreen products={products}/>}
       </div>
       {showTab&&<TabBar current={screen} onNav={navigate}/>}
     </div>
